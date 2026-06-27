@@ -545,16 +545,25 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # provider accepts the image and we reject outright.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap (4 MB).  This is the size we resize an image DOWN to
-# before embedding it into conversation history, regardless of the 20 MB hard
-# ceiling.  Anthropic's per-image base64 limit is 5 MB; once an oversized image
-# is baked into history (e.g. a vision tool-result), it is re-sent on every
-# subsequent turn and permanently wedges the session with a 400 that retries
-# can't clear (the bad bytes are immutable history).  Capping at embed time —
-# with headroom under 5 MB — is the only durable fix.  Matches the post-failure
-# shrink target in agent.conversation_compression so behaviour is consistent
-# whether we resize proactively or reactively.
-_EMBED_TARGET_BYTES = 4 * 1024 * 1024
+# Proactive embed cap (1.5 MB — STOPGAP, lowered from 4 MB 2026-06-16).
+# This is the size we resize EACH image DOWN to before embedding it into
+# conversation history.  Two distinct ceilings matter:
+#   1. Anthropic-direct: 5 MB PER IMAGE (per-image cap).
+#   2. GitHub Copilot proxy: a much tighter WHOLE-REQUEST byte ceiling
+#      (empirically ~5-7 MB for the entire request — images + text + schemas).
+# The 413 recovery path (agent.conversation_compression.try_shrink_image_parts
+# _in_messages) only shrinks images that INDIVIDUALLY exceed its per-image
+# target, so several sub-cap images in one turn can SUM past the Copilot
+# request ceiling, dodge the shrink ("no oversized data-URL image parts to
+# shrink"), then fall through to text compression — which can't shrink image
+# bytes — and brick the session ("413 ... Cannot compress further").  Until the
+# aggregate-aware 413 fix lands, cap each embedded image low enough that the
+# realistic review case (2-3 images/turn) stays under the request ceiling:
+# 1.5 MB base64 each → ~3-4.5 MB for 2-3 images.  Tradeoff: PNGs are
+# downscaled by DIMENSION (not quality) to hit this, so review images lose
+# resolution.  Hard ceiling (_MAX_BASE64_BYTES, 20 MB) and the reactive shrink
+# target in agent.conversation_compression are intentionally unchanged.
+_EMBED_TARGET_BYTES = 1536 * 1024  # 1.5 MB (stopgap; was 4 * 1024 * 1024)
 
 # Proactive embed dimension cap (px, longest side).  Anthropic enforces an
 # 8000px per-side ceiling INDEPENDENTLY of the 5 MB byte cap — a tall full-page
