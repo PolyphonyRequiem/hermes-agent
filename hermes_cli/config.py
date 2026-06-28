@@ -1321,6 +1321,25 @@ DEFAULT_CONFIG = {
         "max_line_length": 2000,
     },
 
+    # Tool-result persistence ceilings. When a single tool result exceeds
+    # max_result_chars (or a turn's results aggregate past max_turn_chars),
+    # the full output spills to a temp file and the model sees a preview +
+    # read_file path instead — no truncation, full output one read away.
+    #
+    # These also act as the guard against a provider's whole-request BYTE
+    # ceiling (Copilot's proxy 413s a request body over ~5-7MB), which the
+    # context-window scaler is blind to. The shipped defaults (100K/200K)
+    # are correct for large-context models on generous providers; lower
+    # max_result_chars (e.g. 35000) on a tight-ceiling proxy so fat results
+    # (skill_view, session_search, kanban_list) persist before they can
+    # stack into a 413. Resolution is a CAP: the smaller of (this value,
+    # the window-scaled value) wins, so it never re-inflates a small model's
+    # budget. Absent section = byte-identical to historical behaviour.
+    "tool_result_budget": {
+        "max_result_chars": 100_000,
+        "max_turn_chars": 200_000,
+    },
+
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
     # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.

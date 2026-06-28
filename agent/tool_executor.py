@@ -59,12 +59,46 @@ def _budget_for_agent(agent) -> BudgetConfig:
     proportional to their window so a single large tool result can't push the
     request past the model's limit (#23767). Falls back to the default budget
     when the context length isn't resolvable.
+
+    On top of the window scaling, an operator ceiling from the
+    ``tool_result_budget`` config section is applied as a CAP: the smaller of
+    (configured value, scaled value) wins. This is the guard against a
+    provider's whole-request byte ceiling (e.g. Copilot's ~5-7MB / HTTP 413),
+    which the window scaler is blind to — lowering ``max_result_chars`` makes
+    fat results (skill_view/session_search/kanban_list) spill to disk before
+    they can stack past the ceiling. Absent config = byte-identical to before.
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        base = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
-        return DEFAULT_BUDGET
+        base = DEFAULT_BUDGET
+    return _apply_budget_overrides(base)
+
+
+def _apply_budget_overrides(base: BudgetConfig) -> BudgetConfig:
+    """Clamp a BudgetConfig by the operator's ``tool_result_budget`` ceilings.
+
+    Returns a new BudgetConfig whose result/turn ceilings are the MIN of the
+    incoming (window-scaled) value and the configured value, so the config can
+    only ever *lower* a budget, never re-inflate a small-model scaled budget.
+    Never raises — any failure returns ``base`` unchanged.
+    """
+    try:
+        from tools.budget_config import get_budget_overrides
+        ov = get_budget_overrides()
+        new_result = min(base.default_result_size, ov["max_result_chars"])
+        new_turn = min(base.turn_budget, ov["max_turn_chars"])
+        if new_result == base.default_result_size and new_turn == base.turn_budget:
+            return base  # no-op: config not lowering anything
+        return BudgetConfig(
+            default_result_size=new_result,
+            turn_budget=new_turn,
+            preview_size=base.preview_size,
+            tool_overrides=base.tool_overrides,
+        )
+    except Exception:
+        return base
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.

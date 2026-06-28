@@ -19,6 +19,89 @@ DEFAULT_TURN_BUDGET_CHARS: int = 200_000
 DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
 
 
+# --- Config-tunable per-result / per-turn ceilings -------------------------
+#
+# The defaults above are correct for large-context models talking to providers
+# with generous request limits. But the persistence threshold (when a tool
+# result spills to disk instead of riding inline) is also the de-facto guard
+# against a provider's *whole-request byte ceiling* — a dimension the
+# context-window scaler (``budget_for_context_window``) is blind to. Copilot's
+# proxy, for example, rejects a request whose serialized body exceeds roughly
+# 5-7 MB with HTTP 413; several 90-99K-char tool results (skill_view,
+# session_search, kanban_list) sit *just under* the 100K spill line, never
+# persist, accumulate in history, and sum past that ceiling — bricking the
+# session with "413 ... Cannot compress further."
+#
+# These ceilings let an operator lower the spill threshold below 100K so fat
+# results persist to disk (preview + read_file path) before they can stack into
+# a 413, WITHOUT touching the source. They are read from ``config.yaml``
+# (``tool_result_budget`` section); when absent, the DEFAULT_* values above are
+# used and behaviour is byte-identical to before. The reader never raises.
+#
+# Example ``config.yaml``::
+#
+#     tool_result_budget:
+#       max_result_chars: 35000     # spill a single tool result above this
+#       max_turn_chars:   90000     # spill the turn's largest results above this aggregate
+#
+# Resolution composes as a CAP: the configured value clamps whatever the
+# context-window scaler produced, so the SMALLER of (config, scaled-default)
+# wins. A tiny-model scaled budget is never re-inflated by a larger config
+# value, and a large-model default is lowered by a smaller config value.
+
+_cached_budget_overrides: dict | None = None
+
+
+def _coerce_positive_int(value, default):
+    """Return ``value`` as a positive int, or ``default`` on any problem."""
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return default
+    return iv if iv > 0 else default
+
+
+def get_budget_overrides() -> Dict[str, int]:
+    """Return operator ceilings from the ``tool_result_budget`` config section.
+
+    Keys: ``max_result_chars`` (per-result spill threshold) and
+    ``max_turn_chars`` (per-turn aggregate budget). Missing or invalid entries
+    fall through to the ``DEFAULT_*`` constants, so an absent section is
+    behaviour-preserving. Cached for the process lifetime to avoid re-reading
+    the config file on every tool call; call ``_reset_budget_overrides_cache()``
+    after a config hot-reload or in tests.
+
+    This function NEVER raises.
+    """
+    global _cached_budget_overrides
+    if _cached_budget_overrides is not None:
+        return _cached_budget_overrides
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        section = cfg.get("tool_result_budget") if isinstance(cfg, dict) else None
+        if not isinstance(section, dict):
+            section = {}
+    except Exception:
+        section = {}
+
+    _cached_budget_overrides = {
+        "max_result_chars": _coerce_positive_int(
+            section.get("max_result_chars"), DEFAULT_RESULT_SIZE_CHARS
+        ),
+        "max_turn_chars": _coerce_positive_int(
+            section.get("max_turn_chars"), DEFAULT_TURN_BUDGET_CHARS
+        ),
+    }
+    return _cached_budget_overrides
+
+
+def _reset_budget_overrides_cache() -> None:
+    """Reset the cached ``tool_result_budget`` overrides (tests / hot-reload)."""
+    global _cached_budget_overrides
+    _cached_budget_overrides = None
+
+
 @dataclass(frozen=True)
 class BudgetConfig:
     """Immutable budget constants for the 3-layer tool result persistence system.
