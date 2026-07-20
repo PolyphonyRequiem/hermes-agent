@@ -141,6 +141,41 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
+def _cross_profile_enabled() -> bool:
+    """Return whether this profile permits session reads from sibling profiles.
+
+    The shipped default preserves existing desktop-link behavior. Profiles that
+    require a hard privacy wall set ``session_search.allow_cross_profile: false``.
+    Configuration read/typing failures deny cross-profile access rather than
+    silently weakening an explicitly configured boundary.
+    """
+    try:
+        import yaml
+        from hermes_constants import get_config_path
+
+        config_path = get_config_path()
+        if not config_path.exists():
+            return True
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return False
+        section = raw.get("session_search")
+        if section is None:
+            return True
+        if not isinstance(section, dict):
+            return False
+        value = section.get("allow_cross_profile", True)
+    except Exception:
+        logging.warning("Failed to parse session_search cross-profile policy; denying access", exc_info=True)
+        return False
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "on", "1"}
+    return False
+
+
 def _resolve_profile_db(profile: str):
     """Open another profile's ``state.db`` read-only, or None for the current one.
 
@@ -639,8 +674,10 @@ def session_search(
     Browse:    pass nothing.
 
     Pass ``profile`` to read another profile's sessions (e.g. resolving an
-    ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
-    anchor is set — the agent has asked for a specific slice.
+    ``@session:<profile>/<id>`` link) only when
+    ``session_search.allow_cross_profile`` is enabled. Scroll wins over
+    read/discovery when an anchor is set — the agent has asked for a specific
+    slice.
     """
     if db is None:
         try:
@@ -650,6 +687,13 @@ def session_search(
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
+
+    allow_cross_profile = _cross_profile_enabled()
+    if not allow_cross_profile:
+        if profile is not None and str(profile).strip():
+            return tool_error("cross-profile session access is disabled for this profile", success=False)
+        if isinstance(session_id, str) and "/" in session_id:
+            return tool_error("cross-profile session access is disabled for this profile", success=False)
 
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
@@ -693,17 +737,18 @@ def session_search(
             return result
 
         # Miss in the target profile — the model may have dropped the owning
-        # profile from the link. Scan every profile and read it from wherever
-        # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
-        if located is not None:
-            try:
-                found = json.loads(_read_session(located, sid))
-            finally:
-                located.close()
-            if found.get("success"):
-                found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
+        # profile from the link. Scan every profile only when this profile's
+        # policy explicitly permits cross-profile session access.
+        if allow_cross_profile:
+            located, owner = _locate_session_db(sid)
+            if located is not None:
+                try:
+                    found = json.loads(_read_session(located, sid))
+                finally:
+                    located.close()
+                if found.get("success"):
+                    found["profile"] = owner
+                    return json.dumps(found, ensure_ascii=False)
         return result
 
     # Limit clamp [1, 10]
@@ -886,9 +931,10 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional. Read sessions from another Hermes profile's database "
-                    "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
-                    "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
+                    "(read-only) when session_search.allow_cross_profile is enabled. "
+                    "Use when resolving an `@session:<profile>/<id>` link: pass the "
+                    "profile segment here with session_id as the id segment. Omit to "
+                    "use the current profile."
                 ),
             },
         },

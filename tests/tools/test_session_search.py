@@ -490,6 +490,47 @@ class TestReadShape:
 
 
 # =========================================================================
+# Cross-profile policy parsing — malformed/unreadable config fails closed
+# =========================================================================
+
+class TestCrossProfilePolicy:
+    def _patch_config_path(self, monkeypatch, path):
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "get_config_path", lambda: path)
+
+        # Reproduce the dangerous fallback from load_config(): malformed YAML
+        # becomes DEFAULT_CONFIG, whose compatibility default is enabled.
+        from hermes_cli import config as config_mod
+        monkeypatch.setattr(
+            config_mod,
+            "load_config",
+            lambda: {"session_search": {"allow_cross_profile": True}},
+        )
+
+    def test_missing_config_uses_compatibility_default(self, tmp_path, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        self._patch_config_path(monkeypatch, tmp_path / "missing.yaml")
+        assert search_tool._cross_profile_enabled() is True
+
+    def test_malformed_config_fails_closed(self, tmp_path, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("session_search:\n  allow_cross_profile: false\nmalformed: [\n")
+        self._patch_config_path(monkeypatch, config_path)
+        assert search_tool._cross_profile_enabled() is False
+
+    def test_unreadable_config_path_fails_closed(self, tmp_path, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        config_path = tmp_path / "config.yaml"
+        config_path.mkdir()
+        self._patch_config_path(monkeypatch, config_path)
+        assert search_tool._cross_profile_enabled() is False
+
+
+# =========================================================================
 # Cross-profile read — `profile` swaps in another profile's DB (read-only)
 # =========================================================================
 
@@ -541,6 +582,59 @@ class TestCrossProfileRead:
         assert result["success"] is True
         assert result["mode"] == "read"
         assert result["profile"] == "asdf"
+
+    def test_cross_profile_disabled_rejects_explicit_profile(self, db, tmp_path, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        monkeypatch.setattr(search_tool, "_cross_profile_enabled", lambda: False, raising=False)
+        result = json.loads(session_search(session_id="s_other", profile="other", db=db))
+
+        assert result["success"] is False
+        assert "cross-profile session access is disabled" in result.get("error", "").lower()
+
+    def test_cross_profile_disabled_rejects_embedded_profile_link(self, db, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        monkeypatch.setattr(search_tool, "_cross_profile_enabled", lambda: False, raising=False)
+        result = json.loads(session_search(session_id="other/s_other", db=db))
+
+        assert result["success"] is False
+        assert "cross-profile session access is disabled" in result.get("error", "").lower()
+
+    def test_cross_profile_disabled_prevents_bare_id_fallback(self, db, tmp_path, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        other_home = tmp_path / "blocked_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        other.create_session("s_blocked", source="cli")
+        other.append_message("s_blocked", role="user", content="must stay isolated")
+        assert other._conn is not None
+        other._conn.commit()
+
+        from collections import namedtuple
+        from hermes_cli import profiles as profiles_mod
+        Info = namedtuple("Info", "name path")
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
+        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("blocked", other_home)])
+        monkeypatch.setattr(search_tool, "_cross_profile_enabled", lambda: False, raising=False)
+
+        result = json.loads(session_search(session_id="s_blocked", db=db))
+
+        assert result["success"] is False
+        assert "session_id not found" in result.get("error", "").lower()
+
+    def test_cross_profile_disabled_does_not_affect_discovery(self, db, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        db.create_session("s_local", source="cli")
+        db.append_message("s_local", role="user", content="local-only discovery marker")
+        monkeypatch.setattr(search_tool, "_cross_profile_enabled", lambda: False, raising=False)
+
+        result = json.loads(session_search(query="local-only discovery marker", db=db))
+
+        assert result["success"] is True
+        assert result["results"][0]["session_id"] == "s_local"
 
     def test_unknown_profile_errors(self, db, monkeypatch, tmp_path):
         self._patch_profiles(monkeypatch, tmp_path, exists=False)

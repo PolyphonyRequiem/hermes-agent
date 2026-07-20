@@ -1422,6 +1422,14 @@ DEFAULT_CONFIG = {
                                       # after live validation.
     },
 
+    # Conversation recall normally resolves explicit @session:<profile>/<id>
+    # links across local profiles and scans sibling state DBs when a bare session
+    # ID misses. Privacy-sensitive profiles can disable both paths while keeping
+    # ordinary discovery/browse/current-profile reads intact.
+    "session_search": {
+        "allow_cross_profile": True,
+    },
+
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
     # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
     # implementations. Per-platform notification opt-out is handled by the
