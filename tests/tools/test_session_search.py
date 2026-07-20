@@ -496,6 +496,7 @@ class TestReadShape:
 class TestCrossProfilePolicy:
     def _patch_config_path(self, monkeypatch, path):
         import hermes_constants
+        monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(hermes_constants, "get_config_path", lambda: path)
 
         # Reproduce the dangerous fallback from load_config(): malformed YAML
@@ -519,6 +520,21 @@ class TestCrossProfilePolicy:
         config_path = tmp_path / "config.yaml"
         config_path.write_text("session_search:\n  allow_cross_profile: false\nmalformed: [\n")
         self._patch_config_path(monkeypatch, config_path)
+        assert search_tool._cross_profile_enabled() is False
+
+    def test_process_profile_home_beats_context_override(self, tmp_path, monkeypatch):
+        import tools.session_search_tool as search_tool
+
+        process_home = tmp_path / "process-profile"
+        process_home.mkdir()
+        (process_home / "config.yaml").write_text(
+            "session_search:\n  allow_cross_profile: false\n"
+        )
+        permissive = tmp_path / "wrong-context.yaml"
+        permissive.write_text("session_search:\n  allow_cross_profile: true\n")
+        self._patch_config_path(monkeypatch, permissive)
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+
         assert search_tool._cross_profile_enabled() is False
 
     def test_unreadable_config_path_fails_closed(self, tmp_path, monkeypatch):

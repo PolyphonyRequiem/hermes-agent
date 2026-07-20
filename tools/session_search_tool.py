@@ -150,10 +150,14 @@ def _cross_profile_enabled() -> bool:
     silently weakening an explicitly configured boundary.
     """
     try:
+        import os
+        from pathlib import Path
+
         import yaml
         from hermes_constants import get_config_path
 
-        config_path = get_config_path()
+        process_home = os.environ.get("HERMES_HOME", "").strip()
+        config_path = Path(process_home) / "config.yaml" if process_home else get_config_path()
         if not config_path.exists():
             return True
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
