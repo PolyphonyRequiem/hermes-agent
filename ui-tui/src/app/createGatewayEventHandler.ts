@@ -844,6 +844,25 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'canvas.render': {
+        // Structured panel from the agent side. Reuses the same transcript
+        // path as locally constructed panels so there is exactly one panel
+        // renderer, and the theme/width behavior can't drift between them.
+        //
+        // Defensive: payload crosses a process boundary from Python, so an
+        // absent/!array `sections` must not throw inside React's render.
+        const p = ev.payload
+        const sections = Array.isArray(p?.sections) ? p.sections : []
+
+        if (!sections.length) {
+          return
+        }
+
+        panel(p?.title ?? '', sections)
+
+        return
+      }
+
       case 'notification.clear':
         // Key-matched clear only — a stale/late clear must not wipe a newer
         // notice (turnController guards the key match).

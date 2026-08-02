@@ -1563,6 +1563,58 @@ describe('createGatewayEventHandler', () => {
     expect(getOverlayState().sudo).toBeNull()
   })
 
+  // ── Canvas render (agent-side structured panels) ─────────────────────
+  describe('canvas.render', () => {
+    it('renders an agent-emitted panel into the transcript', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({
+        payload: {
+          sections: [{ rows: [['session', 'sbpr']], title: 'sbpr' }],
+          title: 'LANE STATUS'
+        },
+        type: 'canvas.render'
+      } as any)
+
+      const panels = appended.filter((m) => m.kind === 'panel')
+
+      expect(panels).toHaveLength(1)
+      expect(panels[0].panelData?.title).toBe('LANE STATUS')
+      expect(panels[0].panelData?.sections).toEqual([{ rows: [['session', 'sbpr']], title: 'sbpr' }])
+    })
+
+    it('takes the same transcript path as a locally built panel', () => {
+      // The whole point of reusing PanelData: one renderer, no drift. An
+      // agent-emitted panel must be indistinguishable from a local one.
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({
+        payload: { sections: [{ text: 'hi' }], title: 'T' },
+        type: 'canvas.render'
+      } as any)
+
+      expect(appended.at(-1)).toMatchObject({ kind: 'panel', role: 'system', text: '' })
+    })
+
+    it('ignores malformed payloads instead of throwing', () => {
+      // Payload crosses a process boundary from Python; a bad frame must not
+      // take down the render tree.
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      expect(() => {
+        onEvent({ payload: {}, type: 'canvas.render' } as any)
+        onEvent({ payload: { sections: [] }, type: 'canvas.render' } as any)
+        onEvent({ payload: { sections: 'nope' }, type: 'canvas.render' } as any)
+        onEvent({ payload: undefined, type: 'canvas.render' } as any)
+      }).not.toThrow()
+
+      expect(appended.filter((m) => m.kind === 'panel')).toHaveLength(0)
+    })
+  })
+
   // ── Credits notice (Strategy B) ──────────────────────────────────────
   describe('credits notice', () => {
     it('shows a notice immediately when idle (no turn in flight)', () => {

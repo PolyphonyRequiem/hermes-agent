@@ -1191,6 +1191,44 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    # -- canvas rendering ---------------------------------------------------
+
+    def render_canvas(self, title: str, sections: list) -> bool:
+        """Render a structured panel in the TUI transcript.
+
+        Emits a ``canvas.render`` event that the Ink UI draws with its own
+        ``<Panel>`` component, so the panel inherits the active skin, the
+        terminal width, and the transcript's virtual-height accounting.
+
+        ``sections`` is a list of dicts, each optionally carrying:
+          ``title`` (str), ``rows`` (list of [key, value] pairs),
+          ``items`` (list of str), ``text`` (str).
+
+        Do NOT write ANSI to stdout to draw in the TUI: under ``--tui`` the
+        agent's stdout is a JSON-RPC pipe to the Node renderer, not a
+        terminal, so raw escape bytes corrupt the transport rather than
+        drawing anything.
+
+        Returns True when the event was emitted, False when there is no TUI
+        transport attached (plain CLI, gateway, cron). Never raises — a
+        cosmetic surface must not break a turn.
+        """
+        try:
+            from tui_gateway.server import _emit
+
+            # sid may be empty: write_json routes by the ContextVar-bound
+            # transport of the calling turn, so the session id is metadata on
+            # the frame rather than the routing key.
+            _emit("canvas.render", "", {"title": title, "sections": sections})
+            return True
+        except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+            logger.debug(
+                "render_canvas unavailable for plugin '%s': %s",
+                self.manifest.name,
+                exc,
+            )
+            return False
+
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:

@@ -1,7 +1,7 @@
 import type { BillingBlock, UsageModelData } from '@hermes/shared/billing'
 import type { HermesSkin } from '@hermes/shared/skin'
 
-import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
+import type { PanelSection, SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
 
 /** The cross-surface skin contract (canonical shape in `@hermes/shared`).
  *  Includes the paired light_colors/dark_colors overlays from #20379. */
@@ -621,6 +621,24 @@ export type GatewayEvent =
       type: 'notification.show'
     }
   | { payload?: { key?: string }; session_id?: string; type: 'notification.clear' }
+  /**
+   * Structured panel emitted by the agent side (plugin hook, tool, or gateway)
+   * and rendered by the TUI's existing `<Panel>` component.
+   *
+   * Deliberately carries STRUCTURE, not pre-rendered ANSI: the renderer owns
+   * layout, theming, and width. A pre-rendered string would hardcode a width,
+   * ignore the active skin, and put raw escape bytes into a JSON-RPC channel
+   * that is not a terminal.
+   *
+   * Payload mirrors `PanelData` so the transcript path is shared with locally
+   * constructed panels (`useMainApp`'s `panel()`), rather than forking a
+   * second rendering path that would drift.
+   */
+  | {
+      payload: { sections?: PanelSection[]; title?: string }
+      session_id?: string
+      type: 'canvas.render'
+    }
   | {
       payload: { user_code?: string; verification_url: string }
       session_id?: string
