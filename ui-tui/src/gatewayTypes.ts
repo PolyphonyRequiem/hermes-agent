@@ -639,6 +639,22 @@ export type GatewayEvent =
       session_id?: string
       type: 'canvas.render'
     }
+  /**
+   * Inline image thumbnail. Carries half-block CELL DATA, not escape bytes:
+   * Ink measures every cell it renders, so a raw kitty/sixel escape has no
+   * countable width and is clobbered on the next repaint. Each cell is a
+   * [top, bottom] RGBA pair drawn as one U+2580 (upper half block) glyph, so
+   * one text row encodes two pixel rows.
+   */
+  | {
+      payload: {
+        caption?: string
+        cells?: number[][][][]
+        title?: string
+      }
+      session_id?: string
+      type: 'canvas.image'
+    }
   | {
       payload: { user_code?: string; verification_url: string }
       session_id?: string

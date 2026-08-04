@@ -863,6 +863,27 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'canvas.image': {
+        // Inline image thumbnail as half-block cell data. Rendered by
+        // <ImageCanvas> rather than written as escape bytes, because Ink must
+        // be able to measure every cell it draws.
+        const p = ev.payload
+        const cells = Array.isArray(p?.cells) ? p.cells : []
+
+        if (!cells.length) {
+          return
+        }
+
+        appendMessage({
+          imageData: { caption: p?.caption, cells, title: p?.title },
+          kind: 'image',
+          role: 'system',
+          text: ''
+        })
+
+        return
+      }
+
       case 'notification.clear':
         // Key-matched clear only — a stale/late clear must not wipe a newer
         // notice (turnController guards the key match).

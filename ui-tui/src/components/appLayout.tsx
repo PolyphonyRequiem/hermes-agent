@@ -28,6 +28,7 @@ import { AgentsOverlay } from './agentsOverlay.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
 import { FloatingOverlays, PromptZone } from './appOverlays.js'
 import { Banner, Panel, SessionPanel } from './branding.js'
+import { ImageCanvas } from './imageCanvas.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { Journey } from './journey.js'
@@ -218,6 +219,13 @@ const TranscriptPane = memo(function TranscriptPane({
                 </Box>
               ) : row.msg.kind === 'panel' && row.msg.panelData ? (
                 <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
+              ) : row.msg.kind === 'image' && row.msg.imageData ? (
+                <ImageCanvas
+                  caption={row.msg.imageData.caption}
+                  cells={row.msg.imageData.cells as never}
+                  t={ui.theme}
+                  title={row.msg.imageData.title}
+                />
               ) : (
                 <MessageLine
                   cols={bodyCols}

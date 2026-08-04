@@ -1229,6 +1229,65 @@ class PluginContext:
             )
             return False
 
+    def render_image(
+        self,
+        path: str,
+        *,
+        title: str = "",
+        max_cols: int = 40,
+        max_rows: int = 20,
+    ) -> bool:
+        """Render an inline image thumbnail in the TUI transcript.
+
+        Encodes *path* as half-block cell data (``agent.image_preview``) and
+        ships it structurally, NOT as raw escape bytes: Ink owns the screen and
+        measures every cell, so raw graphics escapes have no countable width
+        and get clobbered on the next repaint.
+
+        Falls back to a caption-only panel when the image cannot be decoded, so
+        a broken link degrades to a visible note rather than silence.
+
+        Returns True when an event was emitted. Never raises.
+        """
+        try:
+            from agent import image_preview
+
+            info = image_preview.describe(path)
+            caption = "{} · {}x{}".format(
+                info.get("name", "image"),
+                info.get("width", "?"),
+                info.get("height", "?"),
+            )
+
+            if "error" in info:
+                return self.render_canvas(
+                    title or "image",
+                    [{"text": "cannot preview {}: {}".format(info.get("name"), info["error"])}],
+                )
+
+            grid = image_preview.thumbnail_cells(
+                path, max_cols=max_cols, max_rows=max_rows
+            )
+            from tui_gateway.server import _emit
+
+            _emit(
+                "canvas.image",
+                "",
+                {
+                    "title": title or caption,
+                    "caption": caption,
+                    "cells": [
+                        [[list(top), list(bottom)] for top, bottom in row] for row in grid
+                    ],
+                },
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+            logger.debug(
+                "render_image failed for plugin '%s': %s", self.manifest.name, exc
+            )
+            return False
+
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:

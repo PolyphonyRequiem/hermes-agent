@@ -114,8 +114,9 @@ export interface ClarifyReq {
 }
 
 export interface Msg {
+  imageData?: ImageData
   info?: SessionInfo
-  kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
+  kind?: 'diff' | 'event' | 'image' | 'intro' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData
   role: Role
   text: string
@@ -206,6 +207,13 @@ export interface SecretReq {
   envVar: string
   prompt: string
   requestId: string
+}
+
+export interface ImageData {
+  caption?: string
+  /** Rows of [top, bottom] RGBA pixel pairs — one glyph per cell. */
+  cells: number[][][][]
+  title?: string
 }
 
 export interface PanelData {
