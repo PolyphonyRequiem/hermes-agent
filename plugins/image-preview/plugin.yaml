@@ -1,0 +1,6 @@
+name: image-preview
+version: 0.1.0
+description: "Inline half-block image thumbnails in the TUI transcript. Renders images produced by image_generate and vision_analyze."
+author: "Daniel Green (@PolyphonyRequiem)"
+hooks:
+  - post_tool_call
