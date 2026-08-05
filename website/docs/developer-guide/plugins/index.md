@@ -277,6 +277,7 @@ def register(ctx):
 - `ctx.register_cli_command()` registers a CLI subcommand (e.g. `hermes my-plugin <subcommand>`)
 - `ctx.register_command()` registers an in-session slash command (e.g. `/myplugin <args>` inside CLI / gateway chat) — see [Register slash commands](#register-slash-commands) below
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
+- `ctx.render_canvas()` / `ctx.render_image()` — draw structured panels or inline image thumbnails in the TUI transcript — see [Paint in the TUI](#paint-in-the-tui) below
 - If this function crashes, the plugin is disabled but Hermes continues fine
 
 **`dispatch_tool` example — a slash command that runs a tool:**
@@ -326,6 +327,45 @@ Output:
 Plugins (1):
   ✓ calculator v1.0.0 (2 tools, 1 hooks)
 ```
+
+### Paint in the TUI
+
+A plugin can draw in the TUI transcript — structured panels or inline image
+thumbnails — without touching the renderer.
+
+```python
+def register(ctx):
+    ctx.render_canvas("Build status", [
+        {"title": "Tests", "rows": [["passed", "412"], ["failed", "0"]]},
+        {"text": "All green."},
+    ])
+    ctx.render_image("/path/to/chart.png", title="Latency")
+```
+
+**Do NOT write ANSI escape bytes to stdout to draw in the TUI.** Under
+`--tui` the agent's stdout is a JSON-RPC pipe to the Node renderer, not a
+terminal, so kitty/sixel escapes corrupt the transport instead of drawing.
+Ink also measures every cell it renders, so an escape sequence has no
+countable width and is clobbered on the next repaint.
+
+Both methods ship **structured data** instead. `render_image` encodes the
+image as half-block cells: each cell is a `[top, bottom]` RGBA pair drawn as
+one `U+2580` glyph, so a single text row carries two pixel rows. The renderer
+decides how to draw it, which is what keeps the active skin, the terminal
+width, and the transcript's virtual-height accounting correct.
+
+Both return `True` when an event was emitted and `False` when no TUI
+transport is attached (plain CLI, gateway, cron). Neither ever raises — a
+cosmetic surface must not break a turn. `render_image` degrades to a
+caption-only panel when the image cannot be decoded, so a broken path shows
+a visible note rather than silently doing nothing.
+
+Images are downscaled to fit `max_cols` × `max_rows` (default 40×20). Budget
+detail accordingly: at 48×16 you get 32 pixel rows of vertical resolution, so
+bold shapes survive and fine linework does not.
+
+See `plugins/image-preview/` for a complete working consumer — it previews
+images produced by `image_generate` and `vision_analyze`.
 
 ### Debugging plugin discovery
 
