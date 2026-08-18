@@ -2687,6 +2687,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "terminal_refused": [
+                {"task_id": tid, "tracker": ref, "outcome": outcome}
+                for (tid, ref, outcome) in res.terminal_refused
+            ],
+            "terminal_deferred": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.terminal_deferred
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2724,6 +2732,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, ref, outcome in res.terminal_refused:
+        print(
+            f"REFUSED (terminal outcome): {tid} -> {ref} "
+            f"Custom.TerminalOutcome={outcome!r}. A terminal work item never "
+            f"restarts — file a NEW work item referencing the original."
+        )
+    for tid, reason in res.terminal_deferred:
+        print(f"Deferred (tracker unreachable): {tid} — {reason}")
     return 0
 
 

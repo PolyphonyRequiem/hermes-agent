@@ -8064,6 +8064,22 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    terminal_refused: list[tuple[str, str, str]] = field(default_factory=list)
+    """Cards REFUSED dispatch because their ``Tracker:`` work item already
+    carries a terminal outcome. Each entry is ``(task_id, tracker_ref,
+    outcome)``.
+
+    This is NOT a transient skip and NOT operator-actionable in the usual
+    sense: the card will be refused on every subsequent tick too, forever,
+    by design. A terminal work item never restarts — a retry is a NEW work
+    item referencing the original (ADO #502 Part C). Separate bucket so a
+    dashboard can show "correctly refused" rather than "stuck"."""
+    terminal_deferred: list[tuple[str, str]] = field(default_factory=list)
+    """Cards deferred this tick because their tracker could not be READ, as
+    ``(task_id, reason)``. Distinct from ``terminal_refused``: nothing is
+    known about the item, so the card is retried next tick rather than
+    accepted (which would make the guard advisory) or refused (which would
+    convert a network blip into a board-wide halt)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9783,6 +9799,37 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def _terminal_outcome_verdict(conn, task_id: str):
+    """Ask the terminal-outcome guard whether this card may be dispatched.
+
+    Returns a ``GuardVerdict`` (see :mod:`hermes_cli.kanban_terminal_guard`).
+    On ANY internal failure — module missing, DB read error — returns a
+    ``dispatch`` verdict so a broken guard cannot brick every board on the
+    host. That direction is deliberate and is the one place this guard is
+    permissive: refusing on our own bug would halt unrelated work, while
+    the failure mode it protects against (a resurrected terminal item) is
+    already impossible on the overwhelming majority of cards, which carry
+    no ``Tracker:`` line at all.
+    """
+    try:
+        from hermes_cli import kanban_terminal_guard as _tg
+    except Exception:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    try:
+        return _tg.check(row["body"])
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("kanban terminal-outcome guard errored on %s: %s", task_id, exc)
+        return None
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify current system memory pressure: ok/elevated/critical/unknown.
 
@@ -10194,6 +10241,31 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Terminal-outcome guard (ADO #502 Part C, built by #522): refuse
+        # to dispatch a card whose Tracker: work item already ended. Placed
+        # BEFORE the claim so a refused card is never locked, never counts
+        # a failure, and never trips the circuit breaker — it is not
+        # failing, it is correctly finished.
+        _tv = _terminal_outcome_verdict(conn, row["id"])
+        if _tv is not None and _tv.action == "refuse":
+            result.terminal_refused.append(
+                (row["id"], str(_tv.ref), _tv.outcome or "")
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "terminal_refused",
+                        {
+                            "tracker": str(_tv.ref),
+                            "outcome": _tv.outcome,
+                            "reason": _tv.reason,
+                        },
+                    )
+            _log.warning("kanban dispatch: %s", _tv.reason)
+            continue
+        if _tv is not None and _tv.action == "defer":
+            result.terminal_deferred.append((row["id"], _tv.reason))
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -10336,6 +10408,29 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
+        # Terminal-outcome guard — the review lane needs it for the same
+        # reason the ready lane does: a card whose tracker item ended must
+        # not be handed to a reviewer either.
+        _tv = _terminal_outcome_verdict(conn, row["id"])
+        if _tv is not None and _tv.action == "refuse":
+            result.terminal_refused.append(
+                (row["id"], str(_tv.ref), _tv.outcome or "")
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "terminal_refused",
+                        {
+                            "tracker": str(_tv.ref),
+                            "outcome": _tv.outcome,
+                            "reason": _tv.reason,
+                        },
+                    )
+            _log.warning("kanban dispatch: %s", _tv.reason)
+            continue
+        if _tv is not None and _tv.action == "defer":
+            result.terminal_deferred.append((row["id"], _tv.reason))
+            continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
