@@ -576,14 +576,22 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None, *, on_pcm=None):
         self._vc = voice_client
+        self._on_pcm = on_pcm
+        # Fixed-key scalar counts only; no identity, payload or transcript retention.
+        self.live_stats = dict.fromkeys((
+            'udp_packets', 'rtp_packets', 'transport_decrypted', 'transport_errors',
+            'dave_decrypted', 'dave_errors', 'dave_unmapped', 'dave_passthrough',
+            'opus_decoded', 'opus_errors', 'sequence_dropped', 'decoder_limit',
+            'pcm_bytes', 'speaking_events', 'unauthorized_pcm_dropped'), 0)
+        self._live_sequences = {}
+        self._live_hook_restore = None
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
 
         # Decryption
         self._secret_key: Optional[bytes] = None
-        self._dave_session = None
         self._bot_ssrc: int = 0
 
         # SSRC -> user_id mapping (populated from SPEAKING events)
@@ -611,10 +619,10 @@ class VoiceReceiver:
         """Start listening for voice packets."""
         conn = self._vc._connection
         self._secret_key = bytes(conn.secret_key)
-        self._dave_session = conn.dave_session
         self._bot_ssrc = conn.ssrc
 
-        self._install_speaking_hook(conn)
+        if self._live_hook_restore is None:
+            self._install_speaking_hook(conn)
         conn.add_socket_listener(self._on_packet)
         self._running = True
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
@@ -622,6 +630,20 @@ class VoiceReceiver:
     def stop(self):
         """Stop listening and clean up."""
         self._running = False
+        if self._live_hook_restore is not None:
+            conn, ws, original, wrapped = self._live_hook_restore
+            if conn.hook is wrapped:
+                conn.hook = original
+            # conn.hook is optional; DiscordVoiceWebSocket._hook is always called.
+            # Restore discord.py's native no-op, not None, during disconnect.
+            from discord.gateway import DiscordVoiceWebSocket
+            ws_hook = original or DiscordVoiceWebSocket._hook
+            if getattr(ws, '_hook', None) is wrapped:
+                ws._hook = ws_hook
+            # The subscription can precede websocket creation (Live handshake).
+            if getattr(getattr(conn, 'ws', None), '_hook', None) is wrapped:
+                conn.ws._hook = ws_hook
+            self._live_hook_restore = None
         try:
             self._vc._connection.remove_socket_listener(self._on_packet)
         except Exception:
@@ -631,6 +653,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._live_sequences.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -664,13 +687,18 @@ class VoiceReceiver:
                 ssrc = data.get("ssrc")
                 user_id = data.get("user_id")
                 if ssrc and user_id:
-                    logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
+                    if receiver_self._on_pcm is None:
+                        logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
+                    else:
+                        receiver_self.live_stats['speaking_events'] += 1
                     receiver_self.map_ssrc(int(ssrc), int(user_id))
             if original_hook:
                 await original_hook(ws, msg)
 
         # Set on connection state (for future reconnects)
         conn.hook = wrapped_hook
+        if self._on_pcm is not None:
+            self._live_hook_restore = (conn, getattr(conn, 'ws', None), original_hook, wrapped_hook)
         # Set on the current live websocket (for immediate effect)
         try:
             from discord.utils import MISSING
@@ -690,7 +718,9 @@ class VoiceReceiver:
 
         # Log first few raw packets for debugging
         self._packet_debug_count += 1
-        if self._packet_debug_count <= 5:
+        if self._on_pcm is not None:
+            self.live_stats['udp_packets'] += 1
+        if self._on_pcm is None and self._packet_debug_count <= 5:
             logger.debug(
                 "Raw UDP packet: len=%d, first_bytes=%s",
                 len(data), data[:4].hex() if len(data) >= 4 else "short",
@@ -703,7 +733,7 @@ class VoiceReceiver:
         # Lower bits may vary (padding, extension, CSRC count).
         # Payload type (byte 1 lower 7 bits) = 0x78 (120) for voice.
         if (data[0] >> 6) != 2 or (data[1] & 0x7F) != 0x78:
-            if self._packet_debug_count <= 5:
+            if self._on_pcm is None and self._packet_debug_count <= 5:
                 logger.debug("Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1])
             return
 
@@ -713,6 +743,8 @@ class VoiceReceiver:
         # Skip bot's own audio
         if ssrc == self._bot_ssrc:
             return
+        if self._on_pcm is not None:
+            self.live_stats['rtp_packets'] += 1
 
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
@@ -730,7 +762,7 @@ class VoiceReceiver:
             ext_words = struct.unpack_from(">H", data, ext_preamble_offset + 2)[0]
             ext_data_len = ext_words * 4
 
-        if self._packet_debug_count <= 10:
+        if self._on_pcm is None and self._packet_debug_count <= 10:
             with self._lock:
                 known_user = self._ssrc_to_user.get(ssrc, "unknown")
             logger.debug(
@@ -752,8 +784,12 @@ class VoiceReceiver:
             import nacl.secret  # noqa: E402 — delayed import, only in voice path
             box = nacl.secret.Aead(self._secret_key)
             decrypted = box.decrypt(encrypted, header, bytes(nonce))
+            if self._on_pcm is not None:
+                self.live_stats['transport_decrypted'] += 1
         except Exception as e:
-            if self._packet_debug_count <= 10:
+            if self._on_pcm is not None:
+                self.live_stats['transport_errors'] += 1
+            elif self._packet_debug_count <= 10:
                 logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
             return
 
@@ -768,14 +804,14 @@ class VoiceReceiver:
         # bytes into DAVE/Opus and corrupts inbound audio.
         if has_padding:
             if not decrypted:
-                if self._packet_debug_count <= 10:
+                if self._on_pcm is None and self._packet_debug_count <= 10:
                     logger.warning(
                         "RTP padding bit set but no payload (ssrc=%d)", ssrc,
                     )
                 return
             pad_len = decrypted[-1]
             if pad_len == 0 or pad_len > len(decrypted):
-                if self._packet_debug_count <= 10:
+                if self._on_pcm is None and self._packet_debug_count <= 10:
                     logger.warning(
                         "Invalid RTP padding length %d for payload size %d (ssrc=%d)",
                         pad_len, len(decrypted), ssrc,
@@ -787,42 +823,84 @@ class VoiceReceiver:
                 return
 
         # --- DAVE E2EE decrypt ---
-        if self._dave_session:
+        # Native voice state can create/replace DAVE during an epoch transition.
+        dave_session = self._vc._connection.dave_session
+        if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
-            if user_id:
-                try:
-                    import davey
-                    decrypted = self._dave_session.decrypt(
-                        user_id, davey.MediaType.audio, decrypted
-                    )
-                except Exception as e:
-                    # Unencrypted passthrough — use NaCl-decrypted data as-is
-                    if "Unencrypted" not in str(e):
-                        if self._packet_debug_count <= 10:
-                            logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
-                        return
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
-            # Opus decode directly — audio may be in passthrough mode.
-            # Buffer will get a user_id when SPEAKING event arrives later.
+            if not user_id:
+                if self._on_pcm is not None:
+                    self.live_stats['dave_unmapped'] += 1
+                # Mapping is a crypto routing requirement, not authorization.
+                # Drop until SPEAKING arrives; ciphertext can decode as bogus PCM.
+                # Do not guess a user or retain/replay unbounded encrypted audio.
+                return
+            try:
+                import davey
+                plaintext = dave_session.decrypt(
+                    user_id, davey.MediaType.audio, decrypted
+                )
+                if self._on_pcm is not None:
+                    # davey returns permitted passthrough (including silence)
+                    # unchanged. Its UnencryptedWhenPassthroughDisabled error
+                    # is a rejection, never permission to bypass decryption.
+                    counter = 'dave_passthrough' if plaintext == decrypted else 'dave_decrypted'
+                    self.live_stats[counter] += 1
+                decrypted = plaintext
+            except Exception as e:
+                if self._on_pcm is not None:
+                    self.live_stats['dave_errors'] += 1
+                elif self._packet_debug_count <= 10:
+                    logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+                return
 
         # --- Opus decode -> PCM ---
         try:
+            if self._on_pcm is not None:
+                previous = self._live_sequences.get(ssrc)
+                if previous is not None and not 0 < (seq - previous) % 65536 < 32768:
+                    self.live_stats['sequence_dropped'] += 1
+                    return  # Drop duplicate/late RTP; never decode audio backwards.
+                if ssrc not in self._decoders and len(self._decoders) >= 16:
+                    self.live_stats['decoder_limit'] += 1
+                    return  # Bounded decoder bookkeeping, not a speaker authorization gate.
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
-            with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+            if self._on_pcm is not None:
+                self.live_stats['opus_decoded'] += 1
+                self.live_stats['pcm_bytes'] += len(pcm)
+                self._live_sequences[ssrc] = seq
+            self.accept_pcm(ssrc, pcm)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
+            if self._on_pcm is not None:
+                self.live_stats['opus_errors'] += 1
+                return
             logger.debug(
                 "Opus decode error for SSRC %s; reset decoder: %s",
                 ssrc,
                 e,
             )
             return
+
+    def accept_pcm(self, ssrc: int, pcm: bytes) -> None:
+        """Route decoded PCM to one owner: continuous sink OR legacy utterance buffer."""
+        if self._on_pcm is not None:
+            # Authenticate from the transport mapping, never channel membership
+            # inference or a transcript's claimed speaker. Before mixing/audio IO.
+            if self._allowed_user_ids:
+                with self._lock:
+                    user_id = self._ssrc_to_user.get(ssrc)
+                if user_id is None or str(user_id) not in self._allowed_user_ids:
+                    self.live_stats['unauthorized_pcm_dropped'] += 1
+                    return
+            self._on_pcm(ssrc, pcm)
+            return
+        with self._lock:
+            self._buffers[ssrc].extend(pcm)
+            self._last_packet_time[ssrc] = time.monotonic()
 
     # ------------------------------------------------------------------
     # Silence detection
@@ -1092,6 +1170,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._playback_timeout_seconds = self._load_playback_timeout()
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
+        self._live_voice_sessions: Dict[int, Any] = {}
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
@@ -1150,6 +1229,9 @@ class DiscordAdapter(BasePlatformAdapter):
         from hermes_constants import get_hermes_home
         from plugins.platforms.discord.recovery import DiscordRecoveryStore
         self._discord_recovery_store = DiscordRecoveryStore(get_hermes_home())
+        # Native Discord callbacks may outlive the profile scope of connect().
+        # Bind Live to this owner at construction, never to ambient task state.
+        self._live_profile_home = get_hermes_home().resolve()
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -1362,6 +1444,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # connected to Discord gateway and both fire on_message, causing
             # double responses.
             if self._client is not None:
+                from .adapter_live import presence_disconnected
+                await presence_disconnected(self)
                 try:
                     if not self._client.is_closed():
                         await self._client.close()
@@ -1378,10 +1462,32 @@ class DiscordAdapter(BasePlatformAdapter):
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
+            event_client = self._client
+
+            if self.config.extra.get('live_voice', {}).get('enabled') is True:
+                native_dispatch = event_client.dispatch
+
+                def dispatch(event, /, *args, **kwargs):
+                    if event == 'voice_state_update':
+                        # Native moves reuse after; freeze the transition before
+                        # the existing Bot schedules any asynchronous handlers.
+                        from copy import copy
+                        member, before, after = args
+                        args = (member, copy(before), copy(after))
+                    return native_dispatch(event, *args, **kwargs)
+
+                event_client.dispatch = dispatch
+                # ConnectionState retained the original bound dispatch at Bot
+                # construction. Its gateway parser must use the same snapshot.
+                event_client._connection.dispatch = dispatch
 
             # Register event handlers
             @self._client.event
             async def on_ready():
+                if adapter_self._client is not event_client:
+                    return
+                from .adapter_live import presence_ready
+                presence_ready(adapter_self)
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
 
                 # Resolve any usernames in the allowed list to numeric IDs
@@ -1395,6 +1501,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
+
+            @self._client.event
+            async def on_disconnect():
+                if adapter_self._client is not event_client:
+                    return
+                from .adapter_live import presence_disconnected
+                await presence_disconnected(adapter_self)
+
+            @self._client.event
+            async def on_resumed():
+                if adapter_self._client is not event_client:
+                    return
+                from .adapter_live import presence_ready
+                presence_ready(adapter_self)
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1419,6 +1539,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                if adapter_self._client is not event_client:
+                    return
+                from .adapter_live import handle_voice_state_update
+                await handle_voice_state_update(adapter_self, member, before, after)
                 # Only track channels where the bot is connected
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
@@ -1633,6 +1757,10 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if not admitted:
             return False
+        if message.content.strip().split(' ', 1)[0] == '/live':
+            from plugins.platforms.discord.adapter_live import handle_message
+            if await handle_message(self, message):
+                return True
         return await self._handle_message(
             message, role_authorized=role_authorized,
         )
@@ -2150,6 +2278,10 @@ class DiscordAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        # Revoke pending and active Live leases before the first teardown await.
+        live_sessions = getattr(self, '_live_voice_sessions', {})
+        for live in list(live_sessions.values()):
+            live.revoke()
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -2160,7 +2292,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # bot task is the loop running that gateway connection, so cancelling it
         # first leaves the handshake with no transport: it can never complete and
         # blocks until the caller's shutdown timeout fires.
-        for guild_id in list(self._voice_clients.keys()):
+        for guild_id in set(self._voice_clients) | set(live_sessions):
             try:
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
@@ -2836,6 +2968,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _should_backfill_discord_message(self, message: Any) -> bool:
         """Return True when a recent Discord message still needs Hermes work."""
+        if (getattr(message, 'content', '') or '').strip().split(' ', 1)[0] == '/live':
+            return False  # Live controls require a fresh event; never replay historical consent.
         if not self._client or not getattr(self._client, "user", None):
             return False
         if getattr(getattr(message, "author", None), "id", None) == getattr(self._client.user, "id", None):
@@ -4559,6 +4693,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Already connected in this guild?
+            if guild_id in getattr(self, '_live_voice_sessions', {}):
+                return False  # Live owns its connection exclusively; never move/reuse it for STT.
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
                 if existing.channel.id == channel.id:
@@ -4603,7 +4739,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
+        live = getattr(self, '_live_voice_sessions', {}).get(guild_id)
+        if live is not None:
+            await live.close()
+            return
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            live = getattr(self, '_live_voice_sessions', {}).get(guild_id)
+            if live is not None:
+                await live.close()
+                return
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
@@ -4645,6 +4789,8 @@ class DiscordAdapter(BasePlatformAdapter):
         reply can overlap the idle "thinking" loop seamlessly.  Otherwise we
         fall back to the legacy one-shot FFmpegPCMAudio path.
         """
+        if guild_id in getattr(self, '_live_voice_sessions', {}):
+            return False
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return False
@@ -7447,6 +7593,61 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         return " ".join(f"<@{uid}>" for uid in user_ids)
 
+    def _bind_live_control(self, chat_id, message_id, session_key, kind, control_id):
+        source = getattr(self, '_live_call_sources', {}).get(session_key)
+        if source is None or not control_id:
+            return
+        from collections import OrderedDict
+        if not hasattr(self, '_live_control_prompts'):
+            self._live_control_prompts = OrderedDict()
+        self._live_control_prompts[(str(chat_id), str(message_id))] = (
+            source, kind, control_id, session_key)
+        while len(self._live_control_prompts) > 256:
+            self._live_control_prompts.popitem(last=False)
+
+    async def handle_message(self, event):
+        # Only an authenticated TEXT reply to a locally recorded prompt can
+        # control a call. Never redirect ordinary DM history or ambient speech.
+        binding = getattr(self, '_live_control_prompts', {}).get(
+            (str(event.source.chat_id), str(event.reply_to_message_id)))
+        if binding is not None:
+            source, kind, control_id, key = binding
+            runner = getattr(self, 'gateway_runner', None)
+            if (event.internal or not event.allow_gateway_control
+                    or event.message_type != MessageType.TEXT
+                    or runner is None or event.source.profile_route_rejected
+                    or event.source.user_id != source.user_id
+                    or not runner._is_user_authorized(event.source)
+                    or runner._resolve_profile_home_for_source(event.source)
+                        != runner._resolve_profile_home_for_source(source)):
+                return
+            text = (event.text or '').strip()
+            if kind == 'approval':
+                from tools.approval import resolve_gateway_approval
+                require_admin, admins = _resolve_exec_approval_admin_gate(self.config.extra)
+                if require_admin and str(event.source.user_id) not in admins:
+                    await self.send(source.chat_id, 'Use the original approval buttons; admin approval is required.')
+                    return
+                if text not in ('/approve', '/deny'):
+                    await self.send(source.chat_id, 'Reply to this exact prompt with /approve or /deny, or use its buttons.')
+                    return
+                resolved = resolve_gateway_approval(key, 'once' if text == '/approve' else 'deny', request_id=control_id)
+            else:
+                from tools import clarify_gateway
+                pending = clarify_gateway.get_pending_for_session(key, include_choice_prompts=True)
+                if pending is None or pending.clarify_id != control_id:
+                    resolved = False
+                elif text and not text.startswith('/'):
+                    # Exact replied-to question is an explicit freeform answer,
+                    # unlike an unanchored DM or unrelated prose.
+                    resolved = clarify_gateway.resolve_gateway_clarify(control_id, text)
+                else:
+                    await self.send(source.chat_id, 'Reply to this question with your answer, or use its buttons.')
+                    return
+            await self.send(source.chat_id, 'Response recorded.' if resolved else 'This prompt expired or was already resolved; no action taken.')
+            return
+        await super().handle_message(event)
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -7544,6 +7745,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
             msg = await channel.send(**send_kwargs)
             view._message = msg  # store for on_timeout expiration editing
+            from tools.approval import get_pending_gateway_approval
+            pending = get_pending_gateway_approval(session_key) or {}
+            self._bind_live_control(chat_id, msg.id, session_key, 'approval', pending.get('request_id'))
+            if session_key in getattr(self, '_live_call_sources', {}):
+                view._live_request_id = pending.get('request_id')
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
@@ -7713,6 +7919,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 tail=clarify_tail,
             )
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            self._bind_live_control(chat_id, msg.id, session_key, 'clarify', clarify_id)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
@@ -8873,7 +9080,8 @@ def _define_discord_view_classes() -> None:
             # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                count = resolve_gateway_approval(self.session_key, choice,
+                    request_id=getattr(self, '_live_request_id', None))
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,

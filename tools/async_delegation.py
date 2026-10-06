@@ -230,6 +230,12 @@ def _capture_routing_origin() -> Dict[str, Any]:
                 origin[evt_key] = value
     except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
         pass
+    from gateway.live_followup_context import LIVE_FOLLOWUP
+    live = LIVE_FOLLOWUP.get()
+    if live is not None:
+        if not live.route:
+            raise RuntimeError('Live delegation requires a selected follow-up topic')
+        origin['live_result_origin'] = dict(live.route)
     return origin
 
 
@@ -247,7 +253,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            "scope_id", "user_id", "user_name", "live_result_origin",
         )
         if key in record
     }
@@ -375,7 +381,7 @@ def recover_abandoned_delegations() -> int:
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            for _k in ("scope_id", "user_id", "user_name", "live_result_origin"):
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -988,7 +994,7 @@ def _push_completion_event(
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in ("scope_id", "user_id", "user_name", "live_result_origin"):
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1202,7 +1208,7 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in ("scope_id", "user_id", "user_name", "live_result_origin"):
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

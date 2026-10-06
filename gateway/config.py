@@ -714,6 +714,12 @@ class PlatformConfig:
         # and extra so YAML ``discord: gateway_restart_notification: false``
         # works without needing a separate platforms: block.
         extra = _coerce_dict(data.get("extra", {}))
+        # Focused backport: this fork does not yet lift plugin-specific keys.
+        # Support the reviewed platforms.discord.live_voice shape without
+        # changing resolution for any existing setting or mutating caller data.
+        if "live_voice" in data:
+            extra = dict(extra)
+            extra["live_voice"] = _coerce_dict(data["live_voice"])
         _grn = data.get("gateway_restart_notification")
         if _grn is None:
             _grn = extra.get("gateway_restart_notification")

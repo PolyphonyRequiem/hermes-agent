@@ -303,6 +303,42 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
         pass  # Non-critical — skill still loads without config injection
 
 
+def _inject_skill_maturity(loaded_skill: dict[str, Any], parts: list[str]) -> None:
+    """Append a ``[Skill maturity: ...]`` block when the skill declares one.
+
+    Maturity lives in ``metadata.hermes.maturity`` rather than in the
+    ``description`` field, because the description is truncated to
+    SKILL_PROMPT_DESC_LIMIT chars in the always-on system-prompt skill index —
+    a prefix there would eat the trigger clause the index exists to carry.
+    Load time is when the rating actually changes behavior: it tells the agent
+    how much to trust the steps it is about to follow.
+    """
+    try:
+        from agent.skill_utils import (
+            SKILL_MATURITY_GUIDANCE,
+            extract_skill_maturity,
+            parse_frontmatter,
+        )
+
+        raw_content = str(loaded_skill.get("raw_content") or loaded_skill.get("content") or "")
+        if not raw_content:
+            return
+
+        frontmatter, _ = parse_frontmatter(raw_content)
+        maturity = extract_skill_maturity(frontmatter)
+        if not maturity:
+            return
+
+        guidance = SKILL_MATURITY_GUIDANCE.get(maturity, "")
+        line = f"[Skill maturity: {maturity}"
+        if guidance:
+            line += f" — {guidance}"
+        line += "]"
+        parts.extend(["", line])
+    except Exception:
+        pass  # Non-critical — skill still loads without maturity injection
+
+
 def _build_skill_message(
     loaded_skill: dict[str, Any],
     skill_dir: Path | None,
@@ -341,6 +377,9 @@ def _build_skill_message(
 
     # ── Inject resolved skill config values ──
     _inject_skill_config(loaded_skill, parts)
+
+    # ── Inject declared maturity, if any ──
+    _inject_skill_maturity(loaded_skill, parts)
 
     if loaded_skill.get("setup_skipped"):
         parts.extend(

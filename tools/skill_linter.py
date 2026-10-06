@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.skill_utils import (
+    SKILL_MATURITY_LEVELS,
     SKILL_PROMPT_DESC_LIMIT,
     parse_frontmatter,
 )
@@ -210,6 +211,32 @@ def _check_metadata_block(frontmatter: Dict[str, Any]) -> List[LintFinding]:
             findings.append(
                 LintFinding(
                     WARNING, "missing-metadata", "metadata.hermes.tags is missing."
+                )
+            )
+        raw_maturity = hermes_meta.get("maturity")
+        if raw_maturity is None:
+            findings.append(
+                LintFinding(
+                    WARNING,
+                    "missing-maturity",
+                    "metadata.hermes.maturity is missing; declare one of "
+                    + ", ".join(SKILL_MATURITY_LEVELS)
+                    + " so a reader knows how far along this skill is before "
+                    "trusting its steps. It belongs in metadata, NOT in the "
+                    "description (the system-prompt index truncates that).",
+                )
+            )
+        elif (
+            not isinstance(raw_maturity, str)
+            or raw_maturity.strip().strip("'\"").lower() not in SKILL_MATURITY_LEVELS
+        ):
+            findings.append(
+                LintFinding(
+                    WARNING,
+                    "invalid-maturity",
+                    f"metadata.hermes.maturity is {raw_maturity!r}; must be one of "
+                    + ", ".join(SKILL_MATURITY_LEVELS)
+                    + ". Unrecognized values are ignored at load time.",
                 )
             )
     author = str(frontmatter.get("author", ""))

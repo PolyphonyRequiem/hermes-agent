@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.plugin_attention import OUTSTANDING, transition_event
 
 logger = logging.getLogger(__name__)
 
@@ -2696,13 +2697,26 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def same_pending_security_context(existing: MessageEvent, event: MessageEvent) -> bool:
+    """Authority and transient receipt identity must survive a pending merge."""
+    return (
+        existing.internal == event.internal
+        and existing.allow_gateway_control == event.allow_gateway_control
+        and getattr(existing, "_plugin_attention_update", None) is getattr(event, "_plugin_attention_update", None)
+        and all((existing.metadata or {}).get(key) == (event.metadata or {}).get(key) for key in (
+            "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
+            "gateway_session_id", "gateway_session_strict",
+        ))
+    )
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2713,8 +2727,12 @@ def merge_pending_message_event(
     instead of replacing the pending turn. This is used for Telegram bursty
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
+    Return False without mutating either event when authority differs; the
+    caller must enqueue the incoming event as a separate FIFO turn.
     """
     existing = pending_messages.get(session_key)
+    if existing is not None and not same_pending_security_context(existing, event):
+        return False
     if existing:
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -2727,7 +2745,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
@@ -2746,7 +2764,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -2755,9 +2773,10 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
 
     pending_messages[session_key] = event
+    return True
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -3053,6 +3072,8 @@ class BasePlatformAdapter(ABC):
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        self._separate_pending_messages: Dict[str, list[MessageEvent]] = {}
+        self._pending_event_handler: Optional[Callable[..., None]] = None
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
@@ -3679,6 +3700,26 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_pending_event_handler(self, handler: Callable[..., None]) -> None:
+        """Use the gateway FIFO when a raw merge cannot preserve authority."""
+        self._pending_event_handler = handler
+
+    def _queue_pending_message(self, session_key: str, event: MessageEvent, *, merge_text: bool = False) -> None:
+        """Authority-separated FIFO, stage-attention-v3."""
+        if self._pending_event_handler is not None:
+            self._pending_event_handler(session_key, event, merge_text=merge_text)
+            return
+        if (not self._separate_pending_messages.get(session_key)
+                and merge_pending_message_event(self._pending_messages, session_key, event, merge_text=merge_text)):
+            return
+        # Standalone adapters have no gateway FIFO. Retain separate turns
+        # and promote them through the same get_pending_message drain.
+        self._separate_pending_messages.setdefault(session_key, []).append(event)
+
+    def _discard_separate_pending(self, session_key: str, reason: str) -> None:
+        for event in self._separate_pending_messages.pop(session_key, []):
+            transition_event(event, "dropped", reason)
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5615,7 +5656,8 @@ class BasePlatformAdapter(ABC):
 
         existing_sender = _identity(existing)
         incoming_sender = _identity(event)
-        return existing_sender is not None and existing_sender == incoming_sender
+        return (same_pending_security_context(existing, event)
+                and existing_sender is not None and existing_sender == incoming_sender)
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -5641,12 +5683,7 @@ class BasePlatformAdapter(ABC):
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(
-                        self._pending_messages,
-                        session_key,
-                        event,
-                        merge_text=True,
-                    )
+                    self._queue_pending_message(session_key, event, merge_text=True)
                 return
 
         now = time.monotonic()
@@ -5714,12 +5751,7 @@ class BasePlatformAdapter(ABC):
         state = store.pop(session_key, None)
         if state is None:
             return False
-        merge_pending_message_event(
-            self._pending_messages,
-            session_key,
-            state.event,
-            merge_text=True,
-        )
+        self._queue_pending_message(session_key, state.event, merge_text=True)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -5795,7 +5827,8 @@ class BasePlatformAdapter(ABC):
             session_key,
         )
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        transition_event(self._pending_messages.pop(session_key, None), "dropped", "stale_session_cleanup")
+        self._discard_separate_pending(session_key, "stale_session_cleanup")
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -5826,11 +5859,26 @@ class BasePlatformAdapter(ABC):
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
+            transition_event(event, "dropped", "adapter_scheduling_failed")
             return False
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+            self._track_attention_task(event, task)
         return True
+
+    def _track_attention_task(self, event: MessageEvent, task) -> None:
+        if getattr(event, "_plugin_attention_update", None) is None:
+            return
+        event._plugin_attention_waiting = False
+        def _attention_finished(completed):
+            if not getattr(event, "_plugin_attention_waiting", False):
+                transition_event(
+                    event, "dropped",
+                    "adapter_cancelled" if completed.cancelled() else "adapter_handling_ended",
+                    expected=OUTSTANDING,
+                )
+        task.add_done_callback(_attention_finished)
 
     async def cancel_session_processing(
         self,
@@ -5878,7 +5926,8 @@ class BasePlatformAdapter(ABC):
                     exc_info=True,
                 )
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            transition_event(self._pending_messages.pop(session_key, None), "dropped", "session_cancelled")
+            self._discard_separate_pending(session_key, "session_cancelled")
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -5895,7 +5944,7 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = self.get_pending_message(session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -5978,6 +6027,30 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    async def execute_owned_turn(self, event: MessageEvent) -> Optional[str]:
+        """Run one locally owned independent conversation turn to delivery.
+
+        The caller serializes its conversation. Ordinary ingress, policy and
+        delivery remain unchanged; this does not join a shared-chat busy queue.
+        """
+        runner = getattr(self, 'gateway_runner', None)
+        if (not event.source.conversation_id or event.internal
+                or event.allow_gateway_control or not self._message_handler
+                or runner is None or runner._draining
+                or getattr(runner, '_startup_restore_in_progress', False)
+                or event.source.profile_route_rejected
+                or not runner._is_user_authorized(event.source)):
+            raise PermissionError('Independent turn unavailable or unauthorized')
+        key = runner._session_key_for_source(event.source)
+        if key in self._active_sessions:
+            raise RuntimeError('Independent conversation is already processing')
+        self._start_session_processing(event, key)
+        task = self._session_tasks[key]
+        await asyncio.shield(task)
+        if getattr(event, '_live_delivery_failed', False):
+            raise RuntimeError('Selected follow-up delivery failed')
+        return getattr(event, '_handled_response', None) or getattr(event, '_streamed_final_response', None)
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -5987,6 +6060,7 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
+            transition_event(event, "dropped", "no_message_handler")
             return
 
         if event.allow_gateway_control:
@@ -6019,6 +6093,7 @@ class BasePlatformAdapter(ABC):
                 expected_session_key,
                 session_key,
             )
+            transition_event(event, "dropped", "route_changed")
             return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
@@ -6160,7 +6235,7 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                merge_pending_message_event(self._pending_messages, session_key, event)
+                self._queue_pending_message(session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -6179,12 +6254,7 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
-                merge_pending_message_event(
-                    self._pending_messages,
-                    session_key,
-                    event,
-                    merge_text=event.message_type == MessageType.TEXT,
-                )
+                self._queue_pending_message(session_key, event, merge_text=event.message_type == MessageType.TEXT)
             return  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
@@ -6225,6 +6295,9 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        if getattr(event, "_plugin_attention_update", None) is not None:
+            event._plugin_attention_waiting = False
+            transition_event(event, "processing")
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -6277,6 +6350,16 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            event._handled_response = response
+            from gateway.live_followup_context import LIVE_FOLLOWUP
+            live_followup = LIVE_FOLLOWUP.get()
+            if live_followup is not None:
+                if response:
+                    try:
+                        await live_followup.send(str(response))
+                    except Exception:
+                        event._live_delivery_failed = True
+                response = None
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -6763,7 +6846,7 @@ class BasePlatformAdapter(ABC):
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+                pending_event = self.get_pending_message(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -6795,12 +6878,14 @@ class BasePlatformAdapter(ABC):
                 try:
                     self._background_tasks.add(drain_task)
                     drain_task.add_done_callback(self._background_tasks.discard)
+                    self._track_attention_task(pending_event, drain_task)
                 except TypeError:
                     # Tests stub create_task() with non-hashable sentinels; tolerate.
                     pass
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            transition_event(event, "dropped", "adapter_cancelled")
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6808,6 +6893,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            transition_event(event, "dropped", "adapter_handling_error")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6815,7 +6901,12 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
+                from gateway.live_followup_context import LIVE_FOLLOWUP, ResultAdapter
+                _error_adapter = self
+                if LIVE_FOLLOWUP.get() is not None:
+                    event._live_delivery_failed = True
+                    _error_adapter = ResultAdapter(self, LIVE_FOLLOWUP.get())
+                await _error_adapter.send(
                     chat_id=event.source.chat_id,
                     content=(
                         f"Sorry, I encountered an error ({error_type}).\n"
@@ -6894,7 +6985,7 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = self.get_pending_message(session_key)
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -6910,6 +7001,9 @@ class BasePlatformAdapter(ABC):
                     # (#17758 follow-up: prevents the create_task path
                     # from racing with itself across the in-band/finally
                     # boundary).
+                    promoted = self._pending_messages.get(session_key)
+                    if promoted is not None:
+                        self._separate_pending_messages.setdefault(session_key, []).insert(0, promoted)
                     self._pending_messages[session_key] = late_pending
                 else:
                     logger.debug(
@@ -6928,6 +7022,7 @@ class BasePlatformAdapter(ABC):
                     try:
                         self._background_tasks.add(drain_task)
                         drain_task.add_done_callback(self._background_tasks.discard)
+                        self._track_attention_task(late_pending, drain_task)
                     except TypeError:
                         # Tests stub create_task() with non-hashable sentinels; tolerate.
                         pass
@@ -6954,6 +7049,7 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
+            transition_event(event, "handled", expected={"processing"})
     
     def _cleanup_finished_session_task(
         self, session_key: str, interrupt_event: Optional[asyncio.Event]
@@ -7029,7 +7125,11 @@ class BasePlatformAdapter(ABC):
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         except Exception:
             pass
+        for event in self._pending_messages.values():
+            transition_event(event, "dropped", "adapter_shutdown")
         self._pending_messages.clear()
+        for key in tuple(self._separate_pending_messages):
+            self._discard_separate_pending(key, "adapter_shutdown")
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():
@@ -7042,7 +7142,13 @@ class BasePlatformAdapter(ABC):
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        event = self._pending_messages.pop(session_key, None)
+        separate = self._separate_pending_messages.get(session_key)
+        if separate:
+            self._pending_messages[session_key] = separate.pop(0)
+            if not separate:
+                del self._separate_pending_messages[session_key]
+        return event
     
     def build_source(
         self,

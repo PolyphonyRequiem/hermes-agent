@@ -1010,6 +1010,55 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
     }
 
 
+# ── Maturity extraction ───────────────────────────────────────────────────
+
+#: Recognized maturity levels, ordered least → most proven. Declared in
+#: frontmatter as ``metadata.hermes.maturity``. Deliberately NOT part of the
+#: ``description`` field: that is truncated to SKILL_PROMPT_DESC_LIMIT chars in
+#: the always-on system-prompt skill index, where every char is needed for the
+#: trigger clause. Maturity matters at LOAD time (how much to trust the steps),
+#: not at index time (whether to load at all), so it rides in metadata and is
+#: surfaced by skill_view instead.
+SKILL_MATURITY_LEVELS = ("experimental", "beta", "stable", "battle-tested")
+
+SKILL_MATURITY_GUIDANCE = {
+    "experimental": (
+        "unproven; treat the steps as a hypothesis and verify each one against "
+        "the live system before relying on it"
+    ),
+    "beta": (
+        "works but is thinly exercised; expect gaps and stale details, and "
+        "confirm anything load-bearing"
+    ),
+    "stable": "proven in normal use; follow it, but pitfalls may be incomplete",
+    "battle-tested": (
+        "repeatedly proven including failure modes; deviate only with a "
+        "specific reason"
+    ),
+}
+
+
+def extract_skill_maturity(frontmatter: Dict[str, Any]) -> str:
+    """Extract ``metadata.hermes.maturity`` from parsed frontmatter.
+
+    Returns a normalized level from :data:`SKILL_MATURITY_LEVELS`, or ``""``
+    when unset or unrecognized. An unrecognized value is treated as absent
+    rather than an error: maturity is advisory metadata and must never block
+    a skill from loading.
+    """
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    hermes = metadata.get("hermes")
+    if not isinstance(hermes, dict):
+        return ""
+    raw = hermes.get("maturity")
+    if not raw or not isinstance(raw, str):
+        return ""
+    level = raw.strip().strip("'\"").lower()
+    return level if level in SKILL_MATURITY_LEVELS else ""
+
+
 # ── Skill config extraction ───────────────────────────────────────────────
 
 

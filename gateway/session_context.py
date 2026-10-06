@@ -393,6 +393,12 @@ def get_session_env(name: str, default: str = "") -> str:
     """
     import os
 
+    from gateway.live_followup_context import LIVE_FOLLOWUP
+    live = LIVE_FOLLOWUP.get()
+    if live is not None:
+        routed = live.delivery_env(name)
+        if routed is not None:
+            return routed
     var = _VAR_MAP.get(name)
     if var is not None:
         value = var.get()

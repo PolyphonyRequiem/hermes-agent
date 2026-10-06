@@ -353,6 +353,7 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     cache_key = None
+    from gateway.live_followup_context import LIVE_FOLLOWUP
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -374,6 +375,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                LIVE_FOLLOWUP.get() is not None,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -508,6 +510,12 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    from gateway.live_followup_context import LIVE_FOLLOWUP, SCHEMA, TOOL_NAME
+    if LIVE_FOLLOWUP.get() is not None and not _is_delegated_child_context() and 'live_followup' not in (disabled_toolsets or []):
+        filtered_tools = [t for t in filtered_tools if t['function']['name'] != TOOL_NAME]
+        filtered_tools.append({'type': 'function', 'function': SCHEMA})
+    else:
+        filtered_tools = [t for t in filtered_tools if t['function']['name'] != TOOL_NAME]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -627,6 +635,8 @@ def _compute_tool_definitions(
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
+        live_selection = [t for t in filtered_tools if t['function']['name'] == TOOL_NAME]
+        filtered_tools = [t for t in filtered_tools if t['function']['name'] != TOOL_NAME]
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
@@ -646,6 +656,7 @@ def _compute_tool_definitions(
                     f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
             filtered_tools = assembly.tool_defs
+        filtered_tools.extend(live_selection)
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
@@ -1235,6 +1246,12 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+    from gateway.live_followup_context import admission_error
+    route_error = admission_error(function_name, function_args)
+    if function_name == 'select_followup_topic' and 'live_followup' in (disabled_toolsets or []):
+        return tool_error('Follow-up topic selection is disabled for this session')
+    if route_error:
+        return tool_error(route_error)
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them

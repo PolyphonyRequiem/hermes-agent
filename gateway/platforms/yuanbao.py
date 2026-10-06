@@ -1110,9 +1110,8 @@ class RecallGuardMiddleware(InboundMiddleware):
             source=cls._build_source(adapter, group_code, from_account),
             internal=True,
         )
-        # Set pending + signal directly (bypass handle_message to avoid busy-ack).
-        # May overwrite a user message pending in the same ~200ms window — acceptable.
-        adapter._pending_messages[session_key] = synth_event
+        # Bypass busy acknowledgments, but retain earlier turns and receipts.
+        adapter._queue_pending_message(session_key, synth_event)
         active_event = adapter._active_sessions.get(session_key)
         if active_event is not None:
             active_event.set()

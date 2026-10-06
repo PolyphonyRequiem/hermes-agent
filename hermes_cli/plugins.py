@@ -2035,6 +2035,34 @@ class PluginContext:
             )
             return False
 
+    def request_attention(self, content: str, *, session_key: str, attention_key: str) -> dict:
+        """Reserve a single-flight, non-interrupting gateway inspection.
+
+        Acceptance is not handling, owner acknowledgment or delivery. Repeated
+        outstanding keys coalesce. Unknown status is not permission to resend.
+        Trusted plugins are not sandboxed; this API grants no actor authority.
+        """
+        from gateway.plugin_attention import result
+
+        with _plugin_home_scope(self._manager.home_path):
+            if not self._gateway_injection_allowed():
+                return result("refused", reason="injection_permission_denied")
+        plugin_id = self.manifest.key or self.manifest.name
+        try:
+            return self._manager.request_gateway_attention(
+                content=content, session_key=session_key, attention_key=attention_key,
+                plugin_id=plugin_id,
+            )
+        except Exception:
+            logger.warning("Plugin attention host failed", exc_info=True)
+            return result("refused", reason="host_error")
+
+    def attention_status(self, request_id: str) -> dict:
+        """Read only this plugin's receipt on the currently registered host."""
+        return self._manager.gateway_attention_status(
+            plugin_id=self.manifest.key or self.manifest.name, request_id=request_id,
+        )
+
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
         try:
@@ -3407,6 +3435,7 @@ class PluginManager:
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
+        self._gateway_attention: tuple[object, Callable, Callable] | None = None
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -3764,6 +3793,29 @@ class PluginManager:
         if registered is None:
             return False
         return bool(registered[1](**kwargs))
+
+    def set_gateway_attention(self, owner: object, request: Callable, status: Callable) -> None:
+        """Publish attention callbacks without changing the legacy injector."""
+        self._gateway_attention = (owner, request, status)
+
+    def clear_gateway_attention(self, owner: object) -> None:
+        registered = self._gateway_attention
+        if registered is not None and registered[0] is owner:
+            self._gateway_attention = None
+
+    def request_gateway_attention(self, **kwargs: Any) -> dict:
+        from gateway.plugin_attention import result
+        registered = self._gateway_attention
+        if registered is None:
+            return result("refused", reason="no_live_gateway")
+        return registered[1](**kwargs)
+
+    def gateway_attention_status(self, *, plugin_id: str, request_id: str) -> dict:
+        from gateway.plugin_attention import result
+        registered = self._gateway_attention
+        if registered is None:
+            return result("unknown", reason="no_live_gateway")
+        return registered[2](plugin_id, request_id)
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.

@@ -66,6 +66,7 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.plugin_attention import AttentionRegistry, OUTSTANDING, transition_event
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -2528,6 +2529,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    same_pending_security_context,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -4608,6 +4610,9 @@ class TurnRunner:
         adapter = self._runner._adapter_for_source(ctx.source)
         if not adapter:
             return
+        from gateway.live_followup_context import LIVE_FOLLOWUP, ResultAdapter
+        if LIVE_FOLLOWUP.get() is not None:
+            adapter = ResultAdapter(adapter, LIVE_FOLLOWUP.get())
 
         if ctx._native_slack_task_cards and hasattr(
             adapter, "send_native_task_card_progress"
@@ -5278,6 +5283,11 @@ class TurnRunner:
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
+        from gateway.live_followup_context import LIVE_FOLLOWUP
+        if LIVE_FOLLOWUP.get() is not None:
+            # Live voice owns conversation streaming. Text finals go through
+            # the call-owned exact-destination delivery boundary instead.
+            _want_stream_deltas = _want_interim_consumer = False
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -8774,13 +8784,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interrupt follow-up or similar), stage the overflow head in
             the slot so the NEXT recursion picks it up.
         Returns the (possibly updated) pending_event for drain to use.
+        Attention is deferred to a fresh adapter task, not recursive _run_agent,
+        so strict pins, current authorization and receipt completion apply.
         """
+        if getattr(pending_event, "_plugin_attention_update", None) is not None:
+            adapter._pending_messages[session_key] = pending_event
+            return None
         _q_state = self._peek_session_state(session_key)
         overflow = _q_state.conversation.queued_events if _q_state else None
         if not overflow:
             return pending_event
         next_queued = overflow.pop(0)
         if pending_event is None:
+            if getattr(next_queued, "_plugin_attention_update", None) is not None:
+                adapter._pending_messages[session_key] = next_queued
+                return None
             return next_queued
         if adapter is not None and hasattr(adapter, "_pending_messages"):
             adapter._pending_messages[session_key] = next_queued
@@ -9824,9 +9842,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    def _bind_pending_event_handler(self, adapter) -> None:
+        setter = getattr(adapter, "set_pending_event_handler", None)
+        if callable(setter):
+            setter(lambda key, event, *, merge_text=False: self._merge_or_queue_pending_event(
+                key, event, merge_text=merge_text, adapter=adapter))
+
+    def _merge_or_queue_pending_event(self, session_key: str, event: MessageEvent, *, merge_text: bool = False, adapter=None) -> None:
+        adapter = adapter if adapter is not None else self._adapter_for_source(event.source)
+        if adapter is None:
+            transition_event(event, "dropped", "no_adapter")
+            return
+        state = self._peek_session_state(session_key)
+        overflow = state.conversation.queued_events if state else None
+        if not overflow and merge_pending_message_event(adapter._pending_messages, session_key, event, merge_text=merge_text):
+            return
+        self._enqueue_fifo(session_key, event, adapter)
+        transition_event(event, "queued")
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
+            transition_event(event, "dropped", "no_adapter")
             return
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
@@ -9838,24 +9875,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        security_metadata_keys = (
-            "hermes_plugin_id",
-            "hermes_plugin_injection",
-            "gateway_session_key",
-            "gateway_session_id",
-            "gateway_session_strict",
-        )
-        same_security_context = existing is not None and (
-            getattr(existing, "internal", False) == getattr(event, "internal", False)
-            and getattr(existing, "allow_gateway_control", True)
-            == getattr(event, "allow_gateway_control", True)
-            and all(
-                (getattr(existing, "metadata", None) or {}).get(key)
-                == (getattr(event, "metadata", None) or {}).get(key)
-                for key in security_metadata_keys
-            )
-        )
-        if same_security_context and (
+        same_security_context = existing is not None and same_pending_security_context(existing, event)
+        state = self._peek_session_state(session_key)
+        has_overflow = bool(state and state.conversation.queued_events)
+        if same_security_context and not has_overflow and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -9876,9 +9899,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
+            transition_event(event, "dropped", "queue_capacity")
             return
 
+        if getattr(event, "_plugin_attention_update", None) is not None:
+            event._plugin_attention_waiting = True
         self._enqueue_fifo(session_key, event, adapter)
+        transition_event(event, "queued")
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -12589,6 +12616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            self._bind_pending_event_handler(adapter)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -14074,6 +14102,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    self._bind_pending_event_handler(adapter)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -15161,6 +15190,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_busy_session_handler(
             self._make_profile_busy_session_handler(profile_name)
         )
+        self._bind_pending_event_handler(adapter)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -15708,6 +15738,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        from gateway.live_followup_context import LIVE_FOLLOWUP
+        if LIVE_FOLLOWUP.get() is not None:
+            return  # setup chatter is not a visual approval/control prompt
         adapter = self._adapter_for_source(source)
         if not adapter:
             return
@@ -16210,6 +16243,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Track attention handling independently of owner ack or delivery."""
+        if getattr(event, "_plugin_attention_update", None) is None:
+            return await self._handle_message_impl(event)
+        try:
+            receipt = event._plugin_attention_status()
+            if receipt["state"] not in OUTSTANDING:
+                return None
+            if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+                transition_event(event, "dropped", "gateway_not_running")
+                return None
+            if not self._is_user_authorized(event.source, allow_adapter_delegation=False):
+                transition_event(event, "dropped", "current_authorization_denied")
+                return None
+            event._plugin_attention_waiting = False
+            transition_event(event, "processing")
+            return await self._handle_message_impl(event)
+        except asyncio.CancelledError:
+            transition_event(event, "dropped", "handling_cancelled")
+            raise
+        except Exception:
+            transition_event(event, "dropped", "handling_error")
+            raise
+        finally:
+            # Early auth/pin/terminal drops must not strand the overflow FIFO.
+            # The adapter still owns the session guard and schedules its next task.
+            if not getattr(event, "_plugin_attention_waiting", False):
+                adapter = self._adapter_for_source(event.source)
+                key = (event.metadata or {}).get("gateway_session_key")
+                if adapter is not None and key and key not in adapter._pending_messages:
+                    following = self._promote_queued_event(key, adapter, None)
+                    if following is not None:
+                        adapter._pending_messages[key] = following
+
+    async def _handle_message_impl(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -16806,7 +16873,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._merge_or_queue_pending_event(_quick_key, event, adapter=adapter)
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
@@ -16832,12 +16899,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if effective_busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
+                        self._merge_or_queue_pending_event(_quick_key, event, merge_text=True, adapter=adapter)
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -16853,12 +16915,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                    self._merge_or_queue_pending_event(_quick_key, event, merge_text=True, adapter=adapter)
                 return None
             if self._draining:
                 queue_during_drain = self._queue_during_drain_enabled(
@@ -18390,12 +18447,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self,
             self._schedule_plugin_message_injection,
         )
+        if getattr(self, "_plugin_attention", None) is None:
+            self._plugin_attention = AttentionRegistry()
+        get_plugin_manager().set_gateway_attention(
+            self, self._request_plugin_attention, self._plugin_attention.status,
+        )
 
     def _clear_plugin_message_injector(self) -> None:
         """Remove this runner's scheduler without clobbering a newer owner."""
         from hermes_cli.plugins import get_plugin_manager
 
         get_plugin_manager().clear_gateway_message_injector(self)
+        get_plugin_manager().clear_gateway_attention(self)
+        registry = getattr(self, "_plugin_attention", None)
+        if registry is not None and not getattr(self, "_running", False):
+            registry.drop_all("host_unregistered")
+
+    def _request_plugin_attention(self, *, content: str, session_key: str,
+                                  attention_key: str, plugin_id: str) -> dict:
+        registry = self._plugin_attention
+        receipt = registry.reserve(plugin_id, session_key, attention_key, content)
+        if not receipt["ok"] or receipt["coalesced"]:
+            return receipt
+        request_id = receipt["request_id"]
+        try:
+            accepted = self._schedule_plugin_message_injection(
+                content=content, session_key=session_key, plugin_id=plugin_id,
+                attention_request_id=request_id,
+            )
+        except Exception:
+            accepted = False
+        if not accepted:
+            registry.transition(request_id, "refused", "scheduling_failed")
+            return registry.status(plugin_id, request_id)
+        return receipt
 
     def _schedule_plugin_message_injection(
         self,
@@ -18403,6 +18488,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        attention_request_id: str | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop."""
         loop = getattr(self, "_gateway_loop", None)
@@ -18413,6 +18499,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
             content=content,
             plugin_id=plugin_id,
+            **({"attention_request_id": attention_request_id} if attention_request_id else {}),
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -18446,8 +18533,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 accepted = completed.result()
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                if attention_request_id:
+                    self._plugin_attention.transition(attention_request_id, "dropped", "dispatch_cancelled")
                 return
             except Exception:
+                if attention_request_id:
+                    self._plugin_attention.transition(attention_request_id, "dropped", "dispatch_error")
                 logger.warning(
                     "Plugin message injection failed: plugin=%s session=%s",
                     plugin_id,
@@ -18471,16 +18562,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        attention_request_id: str | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
-        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+        def rejected(reason):
+            if attention_request_id:
+                self._plugin_attention.transition(attention_request_id, "dropped", reason)
             return False
+
+        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return rejected("gateway_not_running")
 
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None:
-            return False
+            return rejected("missing_stored_origin")
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
-            return False
+            return rejected("gateway_not_running")
 
         source = dataclasses.replace(entry.origin)
         try:
@@ -18494,7 +18591,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     plugin_id,
                     session_key,
                 )
-                return False
+                return rejected("current_authorization_denied")
         except Exception:
             logger.warning(
                 "Plugin message injection authorization check failed: "
@@ -18503,11 +18600,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 exc_info=True,
             )
-            return False
+            return rejected("authorization_check_failed")
 
         adapter = self._adapter_for_source(source)
         if adapter is None:
-            return False
+            return rejected("no_adapter")
 
         event = MessageEvent(
             text=content,
@@ -18523,7 +18620,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "gateway_session_strict": True,
             },
         )
+        if attention_request_id:
+            registry = self._plugin_attention
+            event._plugin_attention_status = lambda: registry.status(plugin_id, attention_request_id)
+            event._plugin_attention_update = lambda state, reason=None, **kwargs: registry.transition(
+                attention_request_id, state, reason, **kwargs,
+            )
         await adapter.handle_message(event)
+        if attention_request_id:
+            registry.transition(attention_request_id, "queued", expected={"scheduled"})
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id,
@@ -18588,6 +18693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     expected_session_key,
                     derived_session_key,
                 )
+                transition_event(event, "dropped", "route_changed")
                 return
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
@@ -18607,6 +18713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pinned_session_id or "missing",
                     expected_session_key or "missing",
                 )
+                transition_event(event, "dropped", "strict_session_rotated")
                 return
         else:
             # Internal wakes must observe reset policy without becoming user
@@ -24686,6 +24793,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        if 'live_result_origin' in evt:
+            from gateway.live_followup_context import deliver_detached_result
+            return await deliver_detached_result(self, synth_text, evt)
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -25265,6 +25375,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         expects. Best-effort: a CLI-origin event (empty session_key) is left
         as-is and simply won't route on the gateway.
         """
+        if isinstance(evt.get('live_result_origin'), dict):
+            route = evt['live_result_origin']
+            evt.update(platform='discord', chat_type='group',
+                       chat_id=route.get('chat_id'), thread_id=route.get('thread_id'))
+            return
         if evt.get("platform"):
             return  # already enriched
         parsed = _parse_session_key(evt.get("session_key", "") or "")
@@ -26163,6 +26278,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
+        registry = getattr(self, "_plugin_attention", None)
+        if registry is not None:
+            registry.drop_session(session_key, "conversation_boundary")
         # Structural clear: every conversation-scoped field resets in one
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
@@ -28217,6 +28335,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self._adapter_for_source(source)
+        from gateway.live_followup_context import LIVE_FOLLOWUP, ResultAdapter
+        if LIVE_FOLLOWUP.get() is not None and _status_adapter is not None:
+            _status_adapter = ResultAdapter(_status_adapter, LIVE_FOLLOWUP.get())
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
@@ -28391,7 +28512,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # path finds it.
                             _peek_event = _adapter._pending_messages.get(session_key)
                             pending_text = None
-                            if _peek_event is not None:
+                            # Authority-bearing events must run through their
+                            # retained MessageEvent, never receiptless text.
+                            if (_peek_event is not None
+                                    and not getattr(_peek_event, "internal", False)
+                                    and getattr(_peek_event, "_plugin_attention_update", None) is None):
                                 pending_text = _peek_event.text or ""
                                 # Transcribe audio media BEFORE signaling the
                                 # agent, so voice messages interrupt with the
@@ -28679,8 +28804,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 and hasattr(_backup_adapter, 'has_pending_interrupt')
                                 and _backup_adapter.has_pending_interrupt(session_key)):
                             _bp_event = _backup_adapter._pending_messages.get(session_key)
-                            _bp_text = _bp_event.text if _bp_event else None
-                            if _bp_event is not None:
+                            _bp_text = None
+                            if (_bp_event is not None
+                                    and not getattr(_bp_event, "internal", False)
+                                    and getattr(_bp_event, "_plugin_attention_update", None) is None):
+                                _bp_text = _bp_event.text
                                 _bp_media_urls = getattr(_bp_event, "media_urls", None) or []
                                 if self._pending_event_audio_paths(_bp_event):
                                     _bp_text, _ = await self._transcribe_and_echo_pending_voice(
@@ -28781,8 +28909,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 and hasattr(_backup_adapter, 'has_pending_interrupt')
                                 and _backup_adapter.has_pending_interrupt(session_key)):
                             _bp_event = _backup_adapter._pending_messages.get(session_key)
-                            _bp_text = _bp_event.text if _bp_event else None
-                            if _bp_event is not None:
+                            _bp_text = None
+                            if (_bp_event is not None
+                                    and not getattr(_bp_event, "internal", False)
+                                    and getattr(_bp_event, "_plugin_attention_update", None) is None):
+                                _bp_text = _bp_event.text
                                 _bp_media_urls = getattr(_bp_event, "media_urls", None) or []
                                 if self._pending_event_audio_paths(_bp_event):
                                     _bp_text, _ = await self._transcribe_and_echo_pending_voice(
@@ -28951,7 +29082,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
                 pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-                if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+                # A retained head (notably attention) owns the FIFO. Even a
+                # genuine human interrupt behind it must wait for its event,
+                # rather than jumping the queue and executing twice as text.
+                if (result.get("interrupted") and not pending_event
+                        and session_key not in adapter._pending_messages
+                        and result.get("interrupt_message")):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
                         logger.info(
@@ -29046,7 +29182,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        # The drain already consumed this head and promoted
+                        # its successor. Restore both in original FIFO order,
+                        # rather than treating the consumed head as new input.
+                        promoted = adapter._pending_messages.pop(session_key, None)
+                        if promoted is not None:
+                            self._session_state(session_key).conversation.queued_events.insert(0, promoted)
+                        adapter._pending_messages[session_key] = pending_event
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

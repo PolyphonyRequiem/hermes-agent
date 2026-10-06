@@ -628,6 +628,12 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
+        if block_message is None:
+            from gateway.live_followup_context import admission_error
+            block_message = admission_error(function_name, final_args)
+            if block_message is not None:
+                block_error_type = "live_followup_admission"
+
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(

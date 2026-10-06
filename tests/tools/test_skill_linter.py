@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.skill_utils import SKILL_MATURITY_LEVELS
 from tools.skill_linter import (
     ERROR,
     WARNING,
@@ -24,6 +25,7 @@ metadata:
   hermes:
     tags: [arxiv, research]
     related_skills: []
+    maturity: stable
 ---
 
 # My Skill
@@ -175,6 +177,25 @@ def test_lint_skill_reads_from_disk(tmp_path):
     skill_md.write_text(CLEAN)
     findings = lint_skill(skill_md)
     assert findings == []
+
+
+def test_maturity_missing_warns():
+    content = CLEAN.replace("\n    maturity: stable", "")
+    findings = lint_content(content)
+    assert "missing-maturity" in _rules(findings)
+    assert all(f.severity == WARNING for f in findings)
+
+
+def test_maturity_invalid_value_warns():
+    content = CLEAN.replace("maturity: stable", "maturity: pretty-good")
+    findings = lint_content(content)
+    assert "invalid-maturity" in _rules(findings)
+
+
+def test_every_valid_maturity_level_is_clean():
+    for level in SKILL_MATURITY_LEVELS:
+        content = CLEAN.replace("maturity: stable", f"maturity: {level}")
+        assert lint_content(content) == [], f"{level} should lint clean"
 
 
 def test_author_caps_warned():

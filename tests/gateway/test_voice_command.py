@@ -1683,8 +1683,8 @@ class TestVoiceReception:
         return mock_decoder
 
 
-    def test_on_packet_dave_unencrypted_error_passthrough(self):
-        """DAVE decrypt 'Unencrypted' error → use data as-is, don't drop."""
+    def test_on_packet_dave_unencrypted_error_drops(self):
+        """Passthrough-disabled rejection must never reach the decoder."""
         dave = MagicMock()
         dave.decrypt.side_effect = Exception(
             "Failed to decrypt: DecryptionFailed(UnencryptedWhenPassthroughDisabled)"
@@ -1692,14 +1692,14 @@ class TestVoiceReception:
         receiver = self._make_receiver_with_nacl(
             dave_session=dave, mapped_ssrcs={100: 42}
         )
-        self._inject_mock_decoder(receiver, 100)
+        decoder = self._inject_mock_decoder(receiver, 100)
 
         with patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
-        assert 100 in receiver._buffers
-        assert len(receiver._buffers[100]) > 0
+        decoder.decode.assert_not_called()
+        assert not receiver._buffers
 
 
 class TestVoiceTTSPlayback:

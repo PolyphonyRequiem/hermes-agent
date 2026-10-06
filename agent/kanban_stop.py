@@ -9,6 +9,13 @@ tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 This module is policy-only: when a kanban worker tries to finish without a
 terminal board tool, return a bounded synthetic nudge so the conversation
 loop continues instead of exiting.
+
+A valid review handoff (``kanban_request_review`` / ``kanban_request_changes``)
+is ALSO a terminal state for the originating run — the run row ends and the
+dispatcher spawns a successor. The guard must treat those as terminal too, or a
+worker that correctly handed off to review keeps getting nudged toward
+complete/block and can be driven to mutate the newer run. See
+``_TERMINAL_KANBAN_TOOLS``.
 """
 
 from __future__ import annotations
@@ -17,7 +24,25 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+# A kanban worker run reaches a terminal board state via any of these tools.
+# ``kanban_complete``/``kanban_block`` are the classic terminal transitions, but
+# ``kanban_request_review`` and ``kanban_request_changes`` are ALSO terminal for
+# the originating run: the tool call ends the run row (outcome=review_requested /
+# changes_requested) and the dispatcher immediately claims a successor run. If
+# the stop-guard omitted them, an implementation worker that validly handed off
+# to review would keep getting nudged to call complete/block — and worse, could
+# be driven to mutate the newer review run that the dispatcher already spawned.
+# Recognizing the handoff here keeps this session's terminal state anchored to
+# ITS OWN run (session_called_kanban_terminal only scans this conversation's
+# messages), which is exactly the ownership boundary we need.
+_TERMINAL_KANBAN_TOOLS = frozenset(
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    }
+)
 
 _DEFAULT_MAX_ATTEMPTS = 2
 

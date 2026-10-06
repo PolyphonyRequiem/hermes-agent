@@ -185,6 +185,9 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # Local conversation identity, NEVER a transport chat/thread or profile.
+    # Wire readers ignore it; only trusted session persistence restores it.
+    conversation_id: Optional[str] = None
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -279,6 +282,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.conversation_id:
+            d["conversation_id"] = self.conversation_id
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -288,7 +293,7 @@ class SessionSource:
         return d
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
+    def from_dict(cls, data: Dict[str, Any], *, trusted_local: bool = False) -> "SessionSource":
         return cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
@@ -306,6 +311,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            conversation_id=data.get("conversation_id") if trusted_local else None,
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
@@ -922,7 +928,7 @@ class SessionEntry:
     def from_dict(cls, data: Dict[str, Any]) -> "SessionEntry":
         origin = None
         if "origin" in data and isinstance(data["origin"], dict):
-            origin = SessionSource.from_dict(data["origin"])
+            origin = SessionSource.from_dict(data["origin"], trusted_local=True)
         
         platform = None
         if data.get("platform"):
@@ -1126,6 +1132,13 @@ def build_session_key(
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     ns = _session_key_namespace(profile)
+    if source.conversation_id:
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", source.conversation_id):
+            raise ValueError("Invalid local conversation discriminator")
+        base = build_session_key(replace(source, conversation_id=None),
+            group_sessions_per_user, thread_sessions_per_user, profile)
+        return f"{base}:conversation:{source.conversation_id}"
     platform = source.platform.value
     slack_scope_id = (
         str(source.scope_id)
@@ -1989,6 +2002,15 @@ class SessionStore:
         sources: an unattributable transcript is precisely the ambiguity
         this guard exists to avoid.
         """
+        try:
+            recorded_origin = json.loads(recovered.get("origin_json") or "{}")
+        except (TypeError, ValueError):
+            recorded_origin = {}
+        recorded_call = recorded_origin.get("conversation_id") if isinstance(recorded_origin, dict) else None
+        # Peer recovery groups by transport destination, which a call shares
+        # with the DM. It must never adopt another call or the ordinary DM.
+        if (source.conversation_id or recorded_call) and source.conversation_id != recorded_call:
+            return False
         if (
             source.platform != Platform.SLACK
             or source.chat_type == "dm"
@@ -2071,8 +2093,8 @@ class SessionStore:
                 source=source.platform.value,
                 user_id=source.user_id,
                 session_key=session_key,
-                chat_id=source.chat_id if allow_peer_fallback else None,
-                chat_type=source.chat_type if allow_peer_fallback else None,
+                chat_id=source.chat_id if allow_peer_fallback and not source.conversation_id else None,
+                chat_type=source.chat_type if allow_peer_fallback and not source.conversation_id else None,
                 thread_id=source.thread_id,
             )
         except Exception as exc:

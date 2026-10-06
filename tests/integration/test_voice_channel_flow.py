@@ -208,8 +208,8 @@ class TestRealNaClDecrypt:
 class TestRealNaClWithDAVE:
     """NaCl decrypt + DAVE passthrough scenarios with real crypto."""
 
-    def test_dave_unknown_ssrc_passthrough(self):
-        """DAVE enabled but SSRC unknown → skip DAVE, buffer audio."""
+    def test_dave_unknown_ssrc_drops(self):
+        """DAVE enabled but SSRC unknown → drop before Opus."""
         key = _make_secret_key()
         dave = MagicMock()  # DAVE session present but SSRC not mapped
         receiver = _make_voice_receiver(key, dave_session=dave)
@@ -219,12 +219,11 @@ class TestRealNaClWithDAVE:
 
         # DAVE decrypt not called (SSRC unknown)
         dave.decrypt.assert_not_called()
-        # Audio still buffered via passthrough
-        assert 100 in receiver._buffers
-        assert len(receiver._buffers[100]) > 0
+        assert not receiver._buffers
+        assert not receiver._decoders
 
-    def test_dave_unencrypted_error_passthrough(self):
-        """DAVE raises 'Unencrypted' → use NaCl-decrypted data as-is."""
+    def test_dave_unencrypted_error_drops(self):
+        """DAVE rejects cleartext → never bypass the rejection."""
         key = _make_secret_key()
         dave = MagicMock()
         dave.decrypt.side_effect = Exception(
@@ -236,10 +235,10 @@ class TestRealNaClWithDAVE:
         packet = _build_encrypted_rtp_packet(key, b'\xf8\xff\xfe', ssrc=100)
         receiver._on_packet(packet)
 
-        # DAVE was called but failed → passthrough
+        # DAVE was called but rejected this frame.
         dave.decrypt.assert_called_once()
-        assert 100 in receiver._buffers
-        assert len(receiver._buffers[100]) > 0
+        assert not receiver._buffers
+        assert not receiver._decoders
 
     def test_dave_real_error_drops(self):
         """DAVE raises non-Unencrypted error → packet dropped."""
@@ -292,13 +291,17 @@ class TestRTPPaddingStrip:
         """Padding stripped before DAVE → passthrough buffers cleanly."""
         key = _make_secret_key()
         opus_silence = b"\xf8\xff\xfe"
-        dave = MagicMock()  # SSRC unmapped → DAVE skipped, passthrough used
+        dave = MagicMock()
+        dave.decrypt.return_value = opus_silence  # Native permitted passthrough succeeds.
         receiver = _make_voice_receiver(key, dave_session=dave)
+        receiver.map_ssrc(100, 42)
 
         packet = _build_padded_rtp_packet(key, opus_silence, pad_len=4, ssrc=100)
         receiver._on_packet(packet)
 
-        dave.decrypt.assert_not_called()
+        dave.decrypt.assert_called_once()
+        assert dave.decrypt.call_args.args[0] == 42
+        assert dave.decrypt.call_args.args[2] == opus_silence
         assert 100 in receiver._buffers
         assert len(receiver._buffers[100]) > 0
 
