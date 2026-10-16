@@ -311,6 +311,7 @@ def _restore_compressor_attempt_state(
     *,
     durable_cooldown_authoritative: Optional[bool] = None,
     durable_cooldown_state: Optional[dict[str, Any]] = None,
+    restore_durable_cooldown: bool = True,
 ) -> None:
     """Restore the safe per-attempt snapshot after a pre-commit hard cancel."""
     # A successful summary clears the durable cooldown before the outer commit
@@ -319,7 +320,8 @@ def _restore_compressor_attempt_state(
     # durable state and intentionally unpersisted local cooldowns are never
     # converted into destructive DB writes during cancellation.
     if (
-        "_summary_failure_cooldown_until" in snapshot
+        restore_durable_cooldown
+        and "_summary_failure_cooldown_until" in snapshot
         and durable_cooldown_authoritative is not False
         and (
             durable_cooldown_authoritative is True
@@ -383,6 +385,10 @@ def _restore_compressor_attempt_state(
                         exc_info=True,
                     )
     restored = copy.deepcopy(snapshot)
+    # The timeout host may also have advanced its local failure streak.
+    if not restore_durable_cooldown:
+        for name in (*_COMPRESSOR_COOLDOWN_STATE_FIELDS, "_consecutive_timeout_failures"):
+            restored.pop(name, None)
     for name, value in restored.items():
         setattr(compressor, name, value)
 
@@ -458,6 +464,10 @@ class CompressionCommitFence:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cancelled = False
+        # A timeout host owns the new failure row once cancellation wins.
+        # A late summary must roll back its bookkeeping without restoring
+        # the pre-attempt durable cooldown over that newer host outcome.
+        self.preserve_failure_cooldown = False
         self._commit_started = False
         # Lock-free commit-phase marker (#76354 review F1). ``begin_commit``
         # RETAINS ``self._lock`` until ``finish_commit``, so any host-side
@@ -521,18 +531,23 @@ class CompressionCommitFence:
                 cancel_event.set()
             return True
 
-    def try_cancel_before_commit(self) -> Optional[bool]:
+    def try_cancel_before_commit(
+        self, *, preserve_failure_cooldown: bool = False
+    ) -> Optional[bool]:
         """Non-blocking form of :meth:`cancel_before_commit`.
 
         Returns ``None`` while an active commit owns the fence, allowing an
         async caller to yield instead of blocking its event loop.
         """
+        # Reserve the timeout host's failure row before detaching the worker;
+        # ordinary hard-stop cancellation retains exact pre-attempt rollback.
         if not self._lock.acquire(blocking=False):
             return None
         try:
             if self._commit_started:
                 return False
             self._cancelled = True
+            self.preserve_failure_cooldown |= preserve_failure_cooldown
             return True
         finally:
             self._lock.release()
@@ -942,6 +957,7 @@ def run_compress_context_with_progress_timeout(
     try:
         while True:
             waited = time.monotonic() - wait_started
+            since_progress = fence.seconds_since_progress()
             remaining_ceiling = ceiling - waited
             if remaining_ceiling <= 0:
                 break
@@ -949,7 +965,6 @@ def run_compress_context_with_progress_timeout(
             # the LAST PROGRESS event, not from the start of this wait slice.
             # Waiting a full ``idle`` after progress that landed early in the
             # previous slice would allow silence to approach 2x the budget.
-            since_progress = fence.seconds_since_progress()
             wait_slice = min(
                 max(idle - since_progress, 0.005), remaining_ceiling
             )
@@ -958,6 +973,12 @@ def run_compress_context_with_progress_timeout(
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
+                if future.done():
+                    # Propagate a provider timeout, or consume a successful
+                    # result that raced this wait slice's expiry.
+                    result = future.result()
+                    handled_exit = True
+                    return result
                 waited = time.monotonic() - wait_started
                 since_progress = fence.seconds_since_progress()
                 if since_progress < idle and waited < ceiling:
@@ -986,7 +1007,7 @@ def run_compress_context_with_progress_timeout(
             if fence.commit_in_flight:
                 cancelled = False
                 break
-            cancelled = fence.try_cancel_before_commit()
+            cancelled = fence.try_cancel_before_commit(preserve_failure_cooldown=True)
             if cancelled is None:
                 # Round-2 #5: the fence is only held transiently here (lock
                 # setup / cancel admission — an in-flight commit is caught by
@@ -1060,8 +1081,6 @@ def run_compress_context_with_progress_timeout(
         # DB release is holder-scoped).
         handled_exit = True
         fence.release_cancelled_compression_lock()
-        waited = time.monotonic() - wait_started
-        since_progress = fence.seconds_since_progress()
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -1072,9 +1091,9 @@ def run_compress_context_with_progress_timeout(
                 )
         else:
             logger.warning(
-                "Context compression made no progress for %.1fs "
-                "(total wait %.1fs, ceiling %.1fs); continuing without "
-                "compression",
+                "Context compression reached %s (no progress for %.1fs, "
+                "total wait %.1fs, ceiling %.1fs); continuing without compression",
+                "total ceiling" if waited >= ceiling else "idle timeout",
                 since_progress,
                 waited,
                 ceiling,
@@ -3051,6 +3070,9 @@ def compress_context(
                 _compressor_attempt_snapshot,
                 durable_cooldown_authoritative=_durable_cooldown_authoritative,
                 durable_cooldown_state=_durable_cooldown_state,
+                restore_durable_cooldown=not (
+                    commit_fence is not None and commit_fence.preserve_failure_cooldown
+                ),
             )
         except BaseException as _rollback_exc:
             # Compensation failure must surface, but it must not strand the
@@ -3211,6 +3233,7 @@ def compress_context(
                     _compressor_attempt_snapshot,
                     durable_cooldown_authoritative=_durable_cooldown_authoritative,
                     durable_cooldown_state=_durable_cooldown_state,
+                    restore_durable_cooldown=not commit_fence.preserve_failure_cooldown,
                 )
                 if (
                     messages_before_compression is not None

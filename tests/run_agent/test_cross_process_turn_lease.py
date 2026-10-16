@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import sqlite3
 import threading
 import time
@@ -635,3 +636,83 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.release_session_turn_lease("shared", next_holder)
     first.close()
     second.close()
+
+
+def _hold_disposable_write_transaction(path, ready, release):
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        ready.set()
+        assert release.wait(timeout=10)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_real_multiprocess_refresh_contention_stops_without_replaying_reason(
+    monkeypatch, tmp_path
+):
+    """Real BEGIN IMMEDIATE contention stays fail-closed, not synthetic input."""
+    from gateway.run import _is_control_interrupt_message
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("shared", source="test")
+    db.append_message("shared", "user", "original request")
+    # Default 20s exhaustion is covered by the disposable operational proof;
+    # shorten only the test handle's retry patience, not the SQL/lease path.
+    db._WRITE_PATIENCE_S = 0.15
+    agent = _agent_with_db(db, session_id="shared")
+    agent.quiet_mode = True
+    agent._active_children_lock = threading.Lock()
+    agent._active_children = []
+    agent._hard_interrupt_requested = threading.Event()
+    agent._session_turn_lease_refresh_interval = 0.01
+    ctx = multiprocessing.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    writer = ctx.Process(target=_hold_disposable_write_transaction, args=(str(path), ready, release))
+    original_refresh = db.refresh_session_turn_lease
+
+    def refresh_after_writer_ready(*args, **kwargs):
+        assert ready.wait(timeout=5)
+        return original_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(db, "refresh_session_turn_lease", refresh_after_writer_ready)
+    turns = []
+
+    def run_turn(_agent, message, _system, history, *args, **kwargs):
+        turns.append(message)
+        writer.start()
+        assert ready.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while not _agent._interrupt_requested and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _agent._interrupt_requested
+        assert _agent._hard_interrupt_requested.is_set()
+        reason = _agent._interrupt_message
+        assert _is_control_interrupt_message(reason)
+        release.set()
+        writer.join(timeout=5)
+        return {"interrupted": True, "interrupt_message": reason, "messages": history, "final_response": "", "completed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", run_turn)
+    try:
+        result = agent.run_conversation("original request", conversation_history=[])
+        assert result["failed"] is True and result["completed"] is False
+        assert result["error"] == "session_turn_lease_refresh_failed"
+        assert "protect the transcript" in result["final_response"]
+        assert "interrupt_message" not in result
+        assert turns == ["original request"]
+        assert writer.exitcode == 0
+        assert [message["content"] for message in db.get_messages("shared")] == ["original request"]
+        assert not agent._interrupt_requested
+        assert db.try_acquire_session_turn_lease("shared", "next-turn", ttl_seconds=5)
+        db.release_session_turn_lease("shared", "next-turn")
+    finally:
+        release.set()
+        if writer.pid is not None:
+            writer.join(timeout=5)
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(timeout=5)
+        db.close()

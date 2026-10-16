@@ -1830,3 +1830,63 @@ def test_exact_cooldown_restore_api_propagates_sqlite_write_failure(
                 "error": "must propagate",
             },
         )
+
+
+def test_timeout_rollback_preserves_newer_host_cooldown_and_arrivals(tmp_path):
+    """A cancelled late summary must not erase the timeout host's DB row."""
+    from agent.conversation_compression import run_compress_context_with_progress_timeout
+
+    db = SessionDB(tmp_path / "state.db")
+    sid = "HOST_TIMEOUT_COOLDOWN"
+    db.create_session(sid, source="test")
+    db.append_message(sid, "user", "original request")
+    agent = _build_agent_with_db(db, sid, stub_compressor=False)
+    agent._cached_system_prompt = "byte-stable prompt"
+    agent._compression_feasibility_checked = True
+    agent.compression_in_place = True
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    compressor = agent.context_compressor
+
+    def late_summary(messages, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        compressor._clear_compression_failure_cooldown()
+        compressor._last_compression_made_progress = True
+        return [{"role": "user", "content": "late summary"}, {"role": "assistant", "content": "tail"}]
+
+    compressor.compress = late_summary
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)} for i in range(20)]
+
+    def worker(fence):
+        try:
+            return agent._compress_context(messages, "sys", approx_tokens=120000, commit_fence=fence)
+        finally:
+            finished.set()
+
+    recorded = {}
+
+    def on_timeout(*args):
+        db.record_compression_failure_cooldown(sid, time.time() + 900, "session hygiene compression timed out: idle timeout")
+        recorded.update(db.get_compression_failure_cooldown_row(sid))
+
+    try:
+        returned, prompt = run_compress_context_with_progress_timeout(
+            worker=worker, messages=messages, system_prompt_fallback="byte-stable prompt",
+            idle_timeout_seconds=0.4, total_ceiling_seconds=2, on_timeout=on_timeout,
+        )
+        assert started.is_set() and not release.is_set()
+        assert returned is messages and prompt == "byte-stable prompt"
+        db.append_message(sid, "assistant", "arrived while summary detached")
+        before = db.get_messages_as_conversation(sid)
+        release.set()
+        assert finished.wait(timeout=5)
+        assert db.get_compression_failure_cooldown_row(sid) == recorded
+        assert db.get_messages_as_conversation(sid) == before
+        assert agent._cached_system_prompt == "byte-stable prompt"
+        assert db.get_compression_lock_holder(sid) is None
+    finally:
+        release.set()
+        assert finished.wait(timeout=5)
+        agent._end_session_on_close = False
+        agent.close()
+        db.close()

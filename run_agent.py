@@ -8017,13 +8017,11 @@ class AIAgent:
                     return system_message or ""
 
             def _on_timeout(idle, waited, since_progress):
+                reason = "total ceiling" if waited >= total_ceiling else "idle timeout"
                 logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
-                    "compression",
-                    since_progress,
-                    waited,
-                    total_ceiling,
+                    "Context compression reached %s (no progress for %.1fs, "
+                    "total wait %.1fs, ceiling %.1fs); continuing without compression",
+                    reason, since_progress, waited, total_ceiling,
                 )
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
@@ -8045,8 +8043,7 @@ class AIAgent:
                     if callable(record):
                         try:
                             record(
-                                "host compress_context timeout "
-                                "(no summary progress)"
+                                f"host compress_context timeout ({reason})"
                             )
                         except Exception:
                             logger.debug(
@@ -8057,9 +8054,9 @@ class AIAgent:
                 emit = getattr(self, "_emit_warning", None)
                 if callable(emit):
                     emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
+                        f"⚠ Context compression timed out at its {reason} "
+                        f"(no progress for {since_progress:.1f}s, total wait {waited:.1f}s). "
+                        "No messages were dropped — continuing without "
                         "compression. Run /compress to retry, /new for a clean "
                         "session, or check auxiliary.compression."
                     )
@@ -8387,6 +8384,7 @@ class AIAgent:
         durable_turn_lease_activity_lock = threading.Lock()
         durable_turn_lease_turn_active = False
         durable_turn_lease_interrupt_message = None
+        durable_turn_lease_failure = None
         token = None
         acct_token = None
         task_started = False
@@ -8596,8 +8594,8 @@ class AIAgent:
                 )
 
                 def _refresh_durable_turn_lease() -> None:
-                    def _interrupt_turn(message: str) -> None:
-                        nonlocal durable_turn_lease_interrupt_message
+                    def _interrupt_turn(message: str, failure: str) -> None:
+                        nonlocal durable_turn_lease_interrupt_message, durable_turn_lease_failure
                         with durable_turn_lease_activity_lock:
                             if (
                                 durable_turn_lease_stop.is_set()
@@ -8605,6 +8603,7 @@ class AIAgent:
                             ):
                                 return
                             durable_turn_lease_interrupt_message = message
+                            durable_turn_lease_failure = failure
                             try:
                                 self.interrupt(message, hard_cancel=True)
                             except Exception:
@@ -8629,7 +8628,8 @@ class AIAgent:
                                 )
                                 _interrupt_turn(
                                     "Session turn lease lost; stopping to protect "
-                                    "the transcript."
+                                    "the transcript.",
+                                    "session_turn_lease_lost",
                                 )
                                 return
                         except Exception:
@@ -8642,7 +8642,8 @@ class AIAgent:
                             )
                             _interrupt_turn(
                                 "Session turn lease could not be refreshed; "
-                                "stopping to protect the transcript."
+                                "stopping to protect the transcript.",
+                                "session_turn_lease_refresh_failed",
                             )
                             return
 
@@ -8721,6 +8722,20 @@ class AIAgent:
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
             terminal = result if isinstance(result, dict) else {}
+            if terminal.get("interrupted") and durable_turn_lease_interrupt_message:
+                # This reason is internal control, never a user follow-up.
+                # Preserve a different, real incoming interrupt message, but
+                # surface the safety failure rather than silently retrying a
+                # turn whose transcript ownership is now uncertain.
+                if terminal.get("interrupt_message") == durable_turn_lease_interrupt_message:
+                    terminal.pop("interrupt_message", None)
+                terminal["failed"] = True
+                terminal["completed"] = False
+                terminal["error"] = durable_turn_lease_failure
+                terminal["final_response"] = (
+                    durable_turn_lease_interrupt_message
+                    + " Please retry your request; it was not automatically replayed."
+                )
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
             elif terminal.get("failed") is True:

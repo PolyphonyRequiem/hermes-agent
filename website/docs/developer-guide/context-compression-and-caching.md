@@ -67,6 +67,32 @@ The gateway hygiene threshold is intentionally higher than the agent's compresso
 Setting it at 50% (same as the agent) caused premature compression on every turn
 in long gateway sessions.
 
+Hygiene waits use `compression.hygiene_timeout_seconds` (30 seconds by default)
+as an **inactivity** budget, including the wait for the first stream event.
+Reasoning and summary chunks both count as progress. Each wait is also bounded
+by the remaining `hygiene_total_ceiling_seconds` budget (600 seconds by default);
+the ceiling cannot be shorter than one idle window. Neither setting changes
+the transcript-commit fence: a timed-out summary cannot publish later, while an
+already-admitted commit must finish before the next turn proceeds.
+
+Timeout notices distinguish an idle stall from the total ceiling and report
+the evidence captured when the watchdog expired, not tokens arriving afterward.
+The failure cooldown survives gateway restarts and escalates on consecutive
+failures. A cancelled late worker cannot restore an old cooldown over the
+host's newer failure row. Repeated unchanged failure notices are deduplicated
+against the durable row captured **before** dispatch, including expired
+cooldowns. The summary worker may persist its current error before returning,
+so its post-attempt row is not evidence of a previously notified failure.
+A different failure or a failure after successful compression is visible again.
+Deferred cleanup
+waits for the worker, and auxiliary transport timeouts close only their own
+stream, never a client shared with another session.
+
+`compression.hygiene_hard_message_limit` is an independent safety trigger
+(default 5000 messages). A configured lower limit can trigger hygiene even when
+the logged token estimate is below the token threshold.
+
+
 ### 2. Agent ContextCompressor (50% threshold, configurable)
 
 Located in `agent/context_compressor.py`. This is the **primary compression

@@ -18,6 +18,24 @@ The session system lives primarily in two modules:
   processing pipeline: session expiry watching, agent caching, restart recovery, and message
   queuing.
 
+### Durable turn-lease safety stops
+
+`AIAgent.run_conversation` also acquires a SQLite-backed, holder-qualified turn
+lease for clients sharing a conversation across processes. A refresh returning
+false means ownership was lost; a refresh exception means ownership could not
+be confirmed. Both stop the active turn to protect the transcript. A SQLite
+write-lock timeout alone does not identify the competing writer or prove that
+continuing is safe. No automatic retry runs against uncertain ownership.
+
+Lease-stop reasons are internal control, not user messages. The interrupted
+result surfaces the safety failure and retry guidance without replaying its
+reason as a synthetic conversation turn. A real lease-safety failure is delivered
+before a queued human follow-up; unlike routine user-interruption noise, it must
+not disappear when the queue drains. Genuine queued messages retain their
+normal FIFO path and must acquire ownership before processing. Holder-qualified
+refresh/release and transcript writes continue to reject stale owners.
+
+
 ---
 
 ## 1. SessionSource — Message Origin Descriptor

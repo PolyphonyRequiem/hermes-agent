@@ -161,6 +161,16 @@ _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 _HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
 
 
+class _HygieneCompressionTimeout(TimeoutError):
+    """A host watchdog expiry, distinct from a worker's own TimeoutError."""
+
+    def __init__(self, reason: str, waited: float, idle: float):
+        self.reason = reason
+        self.waited = waited
+        self.idle = idle
+        super().__init__(reason)
+
+
 def _hygiene_cooldown_for_failure(
     gateway,
     session_key: str,
@@ -283,8 +293,14 @@ def _record_hygiene_cooldown(
     session_id: str,
     cooldown_seconds: float,
     error: Optional[str] = None,
-) -> None:
+    *,
+    previous_error: Optional[str] = None,
+) -> bool:
     """Persist a session-hygiene compression-failure cooldown to the state DB.
+
+    Return whether this is a new failure reason worth notifying the user.
+    The caller captures ``previous_error`` before dispatch: the real summary
+    worker persists its current failure before returning an aborted result.
 
     Uses the same ``compression_failure_cooldown_until`` column and
     ``record_compression_failure_cooldown`` method that the in-conversation
@@ -300,15 +316,17 @@ def _record_hygiene_cooldown(
     import time as _time
     session_db = getattr(gateway, "_session_db", None)
     if session_db is None:
-        return
+        return True
     session_db = getattr(session_db, "_db", session_db)
     recorder = getattr(session_db, "record_compression_failure_cooldown", None)
     if recorder is None:
-        return
+        return True
+    repeated = bool(error) and previous_error == error
     try:
         recorder(session_id, _time.time() + cooldown_seconds, error)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
+    return not repeated
 
 
 def _status_template_to_regex(template: str) -> str:
@@ -3325,6 +3343,8 @@ _CONTROL_INTERRUPT_MESSAGES = frozenset(
         _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
         _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
         _INTERRUPT_REASON_GATEWAY_RESTART.lower(),
+        "session turn lease lost; stopping to protect the transcript.",
+        "session turn lease could not be refreshed; stopping to protect the transcript.",
     }
 )
 
@@ -19337,6 +19357,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc_info=True,
                                     )
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
+                                # Snapshot the preceding failure BEFORE the
+                                # compressor can persist this attempt's error.
+                                # The raw row includes expired cooldowns, so
+                                # unchanged failures deduplicate across retries.
+                                _hyg_previous_error = None
+                                _hyg_failure_reader = getattr(
+                                    _hyg_session_db, "get_compression_failure_cooldown_row", None,
+                                )
+                                if callable(_hyg_failure_reader):
+                                    try:
+                                        _hyg_previous_failure = await asyncio.to_thread(
+                                            _hyg_failure_reader, session_entry.session_id,
+                                        )
+                                        if isinstance(_hyg_previous_failure, dict):
+                                            _hyg_previous_error = _hyg_previous_failure.get("error")
+                                    except Exception:
+                                        # Unknown prior notification state must
+                                        # not suppress a real new failure.
+                                        logger.debug("Could not read prior hygiene failure", exc_info=True)
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
@@ -19411,36 +19450,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # from the start of this wait slice —
                                             # otherwise silence can approach 2x
                                             # the configured timeout.
-                                            _slice = max(
-                                                _hyg_timeout_seconds
-                                                - _hyg_commit_fence.seconds_since_progress(),
-                                                0.005,
+                                            _hyg_waited = time.monotonic() - _hyg_wait_started
+                                            _slice = min(
+                                                max(
+                                                    _hyg_timeout_seconds
+                                                    - _hyg_commit_fence.seconds_since_progress(),
+                                                    0.005,
+                                                ),
+                                                max(_hyg_total_ceiling_seconds - _hyg_waited, 0),
                                             )
-                                            try:
-                                                _compressed, _ = await asyncio.wait_for(
-                                                    asyncio.shield(_hyg_future),
-                                                    timeout=_slice,
-                                                )
+                                            # wait() never cancels the worker and
+                                            # does not confuse its TimeoutError
+                                            # with expiry of our own watchdog.
+                                            _done, _ = await asyncio.wait(
+                                                (_hyg_future,), timeout=_slice,
+                                            )
+                                            if _done:
+                                                _compressed, _ = _hyg_future.result()
                                                 break
-                                            except asyncio.TimeoutError:
-                                                _hyg_waited = time.monotonic() - _hyg_wait_started
-                                                _idle = _hyg_commit_fence.seconds_since_progress()
-                                                if (
-                                                    _idle < _hyg_timeout_seconds
-                                                    and _hyg_waited < _hyg_total_ceiling_seconds
-                                                ):
-                                                    logger.info(
-                                                        "Session hygiene compression for "
-                                                        "session %s still streaming after "
-                                                        "%.0fs (last progress %.1fs ago) — "
-                                                        "extending wait (ceiling %.0fs)",
-                                                        session_entry.session_id,
-                                                        _hyg_waited, _idle,
-                                                        _hyg_total_ceiling_seconds,
-                                                    )
-                                                    continue
-                                                raise
-                                    except asyncio.TimeoutError:
+                                            _hyg_waited = time.monotonic() - _hyg_wait_started
+                                            _idle = _hyg_commit_fence.seconds_since_progress()
+                                            if _idle < _hyg_timeout_seconds and _hyg_waited < _hyg_total_ceiling_seconds:
+                                                logger.info(
+                                                    "Session hygiene compression for "
+                                                    "session %s still streaming after "
+                                                    "%.0fs (last progress %.1fs ago) — "
+                                                    "extending wait (ceiling %.0fs)",
+                                                    session_entry.session_id,
+                                                    _hyg_waited, _idle,
+                                                    _hyg_total_ceiling_seconds,
+                                                )
+                                                continue
+                                            raise _HygieneCompressionTimeout(
+                                                "total ceiling" if _hyg_waited >= _hyg_total_ceiling_seconds else "idle timeout",
+                                                _hyg_waited, _idle,
+                                            )
+                                    except _HygieneCompressionTimeout as _hyg_timeout:
                                         _cancelled = None
                                         while _cancelled is None:
                                             # #76354 F1: a hung commit retains the
@@ -19451,7 +19496,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _cancelled = False
                                                 break
                                             _cancelled = (
-                                                _hyg_commit_fence.try_cancel_before_commit()
+                                                _hyg_commit_fence.try_cancel_before_commit(preserve_failure_cooldown=True)
                                             )
                                             if _cancelled is None:
                                                 # Round-2 #5: transient
@@ -19481,6 +19526,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene timeout",
                                             )
                                             _hyg_cleanup_deferred = True
+                                            _hyg_notify = True
+                                            _hyg_error = "session hygiene compression timed out: " + _hyg_timeout.reason
                                             if _hyg_failure_cooldown_seconds >= 0:
                                                 _hyg_cooldown = await asyncio.to_thread(
                                                     _hygiene_cooldown_for_failure,
@@ -19488,12 +19535,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     session_key,
                                                     _hyg_failure_cooldown_seconds,
                                                 )
-                                                _record_hygiene_cooldown(
+                                                _hyg_notify = await asyncio.to_thread(
+                                                    _record_hygiene_cooldown,
                                                     self, session_entry.session_id,
-                                                    _hyg_cooldown,
-                                                    "session hygiene compression "
-                                                    "timed out with no output from "
-                                                    "the summary model",
+                                                    _hyg_cooldown, _hyg_error,
+                                                    previous_error=_hyg_previous_error,
                                                 )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
@@ -19507,26 +19553,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
-                                                "made no progress for %.1fs "
-                                                "(total wait %.1fs, ceiling %.1fs); "
+                                                "reached %s (no progress for %.1fs, "
+                                                "total wait %.1fs, ceiling %.1fs); "
                                                 "continuing without compression",
                                                 session_entry.session_id,
-                                                _hyg_commit_fence.seconds_since_progress(),
-                                                time.monotonic() - _hyg_wait_started,
+                                                _hyg_timeout.reason,
+                                                _hyg_timeout.idle,
+                                                _hyg_timeout.waited,
                                                 _hyg_total_ceiling_seconds,
+                                            )
+                                            _timeout_detail = (
+                                                f"at the total limit after {_hyg_timeout.waited:.1f}s "
+                                                f"(last progress {_hyg_timeout.idle:.1f}s earlier). "
+                                                if _hyg_timeout.reason == "total ceiling" else
+                                                f"with no progress for {_hyg_timeout.idle:.1f}s "
+                                                f"(total wait {_hyg_timeout.waited:.1f}s). "
                                             )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
-                                                f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
-                                                "No messages were dropped — continuing without "
+                                                + _timeout_detail
+                                                + "No messages were dropped — continuing without "
                                                 "compression. Run /compress to retry, /reset for "
                                                 "a clean session, or check your "
                                                 "auxiliary.compression model configuration."
                                             )
                                             try:
                                                 _adapter = self._adapter_for_source(source)
-                                                if _adapter and source.chat_id:
+                                                if _hyg_notify and _adapter and source.chat_id:
                                                     await _adapter.send(
                                                         source.chat_id,
                                                         _timeout_msg,
@@ -19728,6 +19781,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 session_key,
                                             )
                                     if _hyg_aborted:
+                                        _hyg_notify = True
                                         if _hyg_failure_cooldown_seconds >= 0:
                                             _hyg_cooldown = await asyncio.to_thread(
                                                 _hygiene_cooldown_for_failure,
@@ -19735,12 +19789,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 session_key,
                                                 _hyg_failure_cooldown_seconds,
                                             )
-                                            _record_hygiene_cooldown(
+                                            _hyg_notify = await asyncio.to_thread(
+                                                _record_hygiene_cooldown,
                                                 self, session_entry.session_id,
                                                 _hyg_cooldown,
                                                 getattr(
                                                     _comp, "_last_summary_error", None
                                                 ),
+                                                previous_error=_hyg_previous_error,
                                             )
                                         from agent.session_activity import (
                                             ActivityProvenance,
@@ -19768,7 +19824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
                                         try:
                                             _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
+                                            if _hyg_notify and _adapter and source.chat_id:
                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -29194,10 +29250,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
-                if not was_interrupted:
-                    # Queued message after normal completion — deliver the first
-                    # response before processing the queued follow-up.
-                    # Skip if streaming already delivered it.
+                _lease_safety_failure = bool(result.get("failed")) and result.get("error") in {
+                    "session_turn_lease_lost", "session_turn_lease_refresh_failed",
+                }
+                if not was_interrupted or _lease_safety_failure:
+                    # Deliver completed responses and independent lease-safety
+                    # failures before a queued human turn. A real ownership
+                    # failure is not the routine interrupted-response noise.
+                    # Skip text already confirmed delivered by streaming.
                     _sc = stream_consumer_holder[0]
                     if _sc and stream_task:
                         try:
@@ -29286,9 +29346,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     await _bg_result
                             except Exception:
                                 pass
-                # else: interrupted — discard the interrupted response ("Operation
-                # interrupted." is just noise; the user already knows they sent a
-                # new message).
+                # Otherwise an ordinary user interrupt discards its routine
+                # interrupted response; the user already sent a new message.
 
                 updated_history = result.get("messages", history)
                 next_source = source

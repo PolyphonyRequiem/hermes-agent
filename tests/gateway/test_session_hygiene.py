@@ -1196,3 +1196,189 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["first_token", "reasoning", "stall", "ceiling", "arrival"])
+async def test_hygiene_wait_observes_real_auxiliary_stream(
+    monkeypatch, tmp_path, caplog, mode
+):
+    """Exercise the actual chunk consumer, not synthetic fence heartbeats."""
+    from agent.auxiliary_client import _create_with_progress, aux_progress_hook
+
+    release = threading.Event()
+    finished = threading.Event()
+    committed = threading.Event()
+    closed = threading.Event()
+    streaming = threading.Event()
+
+    class Stream:
+        def __iter__(self):
+            if mode == "first_token":
+                time.sleep(0.15)
+            for _ in range(9 if mode in {"reasoning", "ceiling"} else 1):
+                time.sleep(0.08)
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(reasoning_content="thinking", content=None),
+                        finish_reason=None,
+                    )]
+                )
+            if mode == "arrival":
+                streaming.set()
+                assert release.wait(timeout=5)
+            if mode == "stall":
+                assert release.wait(timeout=5)
+                yield SimpleNamespace(choices=[])
+
+        def close(self):
+            closed.set()
+
+    class StreamingAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.session_id = kwargs["session_id"]
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *args, commit_fence=None, **kwargs):
+            client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+                create=lambda **kwargs: Stream()
+            )))
+            try:
+                with aux_progress_hook(commit_fence.touch_progress):
+                    _create_with_progress(client, {"model": "test", "timeout": 1})
+                if commit_fence.begin_commit():
+                    try:
+                        committed.set()
+                    finally:
+                        commit_fence.finish_commit()
+                return messages, ""
+            finally:
+                finished.set()
+
+    idle = 0.4
+    ceiling = 0.5 if mode == "ceiling" else 3
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, StreamingAgent,
+        f"compression:\n  enabled: true\n  hygiene_timeout_seconds: {idle}\n"
+        f"  hygiene_total_ceiling_seconds: {ceiling}\n",
+    )
+    if mode == "stall":
+        # The late stream resumes while host cooldown bookkeeping is running.
+        # The warning must report the watchdog's frozen idle observation, not
+        # the late token's age (the production 'no progress for 0.8s' paradox).
+        import gateway.run as gateway_run
+
+        original = gateway_run._hygiene_cooldown_for_failure
+
+        def resume_during_cooldown(*args):
+            release.set()
+            assert finished.wait(timeout=5)
+            return original(*args)
+
+        monkeypatch.setattr(gateway_run, "_hygiene_cooldown_for_failure", resume_during_cooldown)
+
+    try:
+        if mode == "arrival":
+            task = asyncio.create_task(runner._handle_message(event))
+            assert await asyncio.wait_for(asyncio.to_thread(streaming.wait), timeout=5)
+            followup = MessageEvent(text="arrived during compression", source=event.source, message_id="2")
+            assert await runner._handle_message(followup) is None
+            assert runner._run_agent.await_count == 0
+            assert list(adapter._pending_messages.values()) == [followup]
+            release.set()
+            assert await task == "ok"
+            assert list(adapter._pending_messages.values()) == [followup]
+        else:
+            assert await runner._handle_message(event) == "ok"
+        warnings = [item["content"] for item in adapter.sent if "Context compression timed out" in item["content"]]
+        if mode in {"first_token", "reasoning", "arrival"}:
+            assert warnings == []
+            assert committed.is_set()
+        else:
+            assert len(warnings) == 1
+            assert "no output" not in warnings[0]
+            assert not committed.is_set()
+            if mode == "ceiling":
+                assert "total" in warnings[0]
+            else:
+                assert "no progress for" in warnings[0]
+                reported_idle = float(warnings[0].split("no progress for ", 1)[1].split("s", 1)[0])
+                assert reported_idle >= idle
+                assert any("idle timeout" in record.message for record in caplog.records)
+        runner.session_store.rewrite_transcript.assert_not_called()
+        assert runner._run_agent.await_count == 1
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=5)
+        await asyncio.gather(*list(getattr(runner, "_deferred_agent_cleanup_tasks", ())))
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_failure_notice_deduplicates_across_expired_cooldown(
+    monkeypatch, tmp_path
+):
+    """Repeated unchanged failures stay internal; a changed blocker is visible."""
+    from hermes_state import SessionDB
+    from agent.context_compressor import ContextCompressor
+
+    worker_errors = []
+
+    class AbortingAgent:
+        error = "summary provider unavailable"
+
+        def __init__(self, **kwargs):
+            self.model = "test/model"
+            self.session_id = kwargs["session_id"]
+            self.context_compressor = ContextCompressor(
+                model=self.model,
+                summary_model_override=self.model,
+                config_context_length=200000,
+                protect_first_n=2,
+                protect_last_n=2,
+                quiet_mode=True,
+                abort_on_summary_failure=True,
+            )
+            self.context_compressor.bind_session_state(db, self.session_id)
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *args, **kwargs):
+            compressed = self.context_compressor.compress(
+                messages, current_tokens=120000, force=True,
+            )
+            # The real summary failure already persisted the current error.
+            # Reading the DB only after the worker returns mutes this failure
+            # against itself, including the first and changed error cases.
+            worker_errors.append(db.get_compression_failure_cooldown_row(self.session_id)["error"])
+            assert self.context_compressor._last_compress_aborted
+            assert worker_errors[-1] == self.error
+            return compressed, ""
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("repeat-failure", source="test")
+    try:
+        notices = []
+        for error in [AbortingAgent.error, AbortingAgent.error, "different provider failure"]:
+            previous = db.get_compression_failure_cooldown_row("repeat-failure")
+            if previous["error"]:
+                db.record_compression_failure_cooldown("repeat-failure", time.time() - 1, previous["error"])
+            AbortingAgent.error = error
+
+            def fail_provider(**kwargs):
+                raise Exception(error)
+
+            monkeypatch.setattr("agent.context_compressor.call_llm", fail_provider)
+            runner, adapter, event = _make_cooldown_runner(
+                monkeypatch, tmp_path, AbortingAgent, db, "repeat-failure"
+            )
+            runner.session_store.load_transcript.return_value = _make_history(20, content_size=400)
+            assert await runner._handle_message(event) == "ok"
+            notices.append([item for item in adapter.sent if "Context compression aborted" in item["content"]])
+        assert [len(items) for items in notices] == [1, 0, 1]
+        assert worker_errors == ["summary provider unavailable", "summary provider unavailable", "different provider failure"]
+        assert db.get_compression_failure_cooldown("repeat-failure")["remaining_seconds"] > 2600
+    finally:
+        db.close()

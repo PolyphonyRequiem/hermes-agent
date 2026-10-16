@@ -1925,3 +1925,52 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["session_turn_lease_lost", "session_turn_lease_refresh_failed", None])
+async def test_queued_human_sees_lease_safety_failure_before_followup(
+    monkeypatch, tmp_path, failure
+):
+    """Exercise the real queued consumer; ordinary user interrupts stay quiet."""
+    events = []
+    safety = "Session turn lease could not be refreshed; stopping to protect the transcript. Please retry your request; it was not automatically replayed."
+
+    class OrderedAdapter(ProgressCaptureAdapter):
+        async def send(self, chat_id, content, **kwargs):
+            events.append(("send", content))
+            return await super().send(chat_id, content, **kwargs)
+
+    class InterruptedAgent:
+        calls = 0
+
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            type(self).calls += 1
+            events.append(("run", message))
+            if type(self).calls == 1:
+                return {
+                    "final_response": safety if failure else "Operation interrupted.",
+                    "messages": [], "api_calls": 0,
+                    "failed": bool(failure), "completed": False,
+                    "interrupted": True, "error": failure,
+                }
+            return {"final_response": "follow-up processed", "messages": [], "api_calls": 0}
+
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, InterruptedAgent,
+        session_id="queued-lease-safety",
+        pending_text="real queued human",
+        config_data={"display": {"tool_progress": "off", "interim_assistant_messages": False}},
+        adapter_cls=OrderedAdapter,
+    )
+    expected = [("run", "hello")]
+    if failure:
+        expected.append(("send", safety))
+    expected.append(("run", "real queued human"))
+    assert events == expected
+    assert result["final_response"] == "follow-up processed"
+    assert not adapter._pending_messages
+    assert InterruptedAgent.calls == 2

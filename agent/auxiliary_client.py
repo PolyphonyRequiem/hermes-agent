@@ -1676,60 +1676,35 @@ class _CodexCompletionsAdapter:
         def _timeout_message() -> str:
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
-        def _close_client_on_timeout() -> None:
+        def _close_stream_on_timeout() -> None:
             begin_timeout_cleanup = getattr(
                 protected_cancel_check, "begin_timeout_cleanup", None
             )
             if callable(begin_timeout_cleanup):
-                timeout_won = bool(begin_timeout_cleanup())
-            else:
-                timeout_won = not (
-                    callable(protected_cancel_check)
-                    and _captured_aux_cancel_requested(protected_cancel_check)
-                )
-            # Publish transport timeout only after the attempt-local decision is
-            # fixed, so owner polling cannot observe completion in between.
+                # Preserve timeout-vs-explicit-cancel arbitration even though
+                # neither outcome may close a process-shared transport.
+                begin_timeout_cleanup()
             timed_out.set()
-            if not timeout_won:
-                # The request owner already hard-cancelled this attempt. The
-                # OpenAI client is process-shared, so closing/evicting it here
-                # would disrupt unrelated sessions. Wake only this attempt's
-                # event stream when responses.create() returned one in time;
-                # otherwise rely on the bounded SDK/provider timeout.
-                with attempt_stream_lock:
-                    stream = attempt_stream[0] if attempt_stream else None
-                close_stream = getattr(stream, "close", None)
-                if callable(close_stream):
-                    try:
-                        close_stream()
-                    except Exception:
-                        logger.debug(
-                            "Codex auxiliary: cancelled attempt stream close "
-                            "during timeout failed",
-                            exc_info=True,
-                        )
-                return
-            close = getattr(self._client, "close", None)
-            if callable(close):
+            # Only this request's stream is ours to close. Closing/evicting
+            # the cached client poisons concurrent and successive auxiliary
+            # requests, including unrelated sessions. If create() is still
+            # blocked, its SDK timeout bounds it; close the late stream below.
+            with attempt_stream_lock:
+                stream = attempt_stream[0] if attempt_stream else None
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
                 try:
-                    close()
+                    close_stream()
                 except Exception:
-                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
-            # The cached auxiliary client wraps this same ``self._client``
-            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
-            # this instance).  After we close the httpx transport above, the
-            # cache must drop that entry — otherwise the next auxiliary call
-            # (compression retry, memory flush, etc.) reuses the dead client
-            # and fails fast with a connection error.  See issue #23432.
-            try:
-                _evict_cached_client_instance(self._client)
-            except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
+                    logger.debug(
+                        "Codex auxiliary: attempt stream close during timeout failed",
+                        exc_info=True,
+                    )
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
                 if not timed_out.is_set():
-                    _close_client_on_timeout()
+                    _close_stream_on_timeout()
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
@@ -1751,7 +1726,7 @@ class _CodexCompletionsAdapter:
 
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                timeout_timer = threading.Timer(float(total_timeout), _close_stream_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
@@ -1783,14 +1758,9 @@ class _CodexCompletionsAdapter:
             event_stream = self._client.responses.create(**stream_kwargs)
             with attempt_stream_lock:
                 attempt_stream.append(event_stream)
-            # The timer can fire while responses.create() is blocked. If the
-            # cancelled attempt had no stream to close at that instant, close it
-            # now that it is safely attempt-owned; never touch the shared client.
-            if (
-                timed_out.is_set()
-                and callable(protected_cancel_check)
-                and _captured_aux_cancel_requested(protected_cancel_check)
-            ):
+            # A timeout can fire before create() returns an attempt-owned
+            # stream. Close it now; the shared client remains usable.
+            if timed_out.is_set():
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):
                     try:
@@ -1947,8 +1917,7 @@ class AsyncCodexAuxiliaryClient:
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
         # Mirror the sync wrapper's _real_client so cache eviction by leaf
-        # OpenAI client (e.g. _close_client_on_timeout in #23482) drops
-        # this async entry too. Without this, sync and async cache entries
+        # OpenAI client drops this async entry too. Without this, cache entries
         # diverge on poisoning: the sync entry is evicted but the async
         # entry keeps reusing the closed transport, failing every
         # subsequent async aux call with 'Connection error' until the

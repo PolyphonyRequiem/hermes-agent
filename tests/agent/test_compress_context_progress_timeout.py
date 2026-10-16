@@ -533,3 +533,55 @@ class TestCompressContextForwarderOwnsTimeout:
         assert seen["fence"] is fence
         assert prompt == "sys"
         assert msgs[0]["content"] == "ok"
+
+
+def test_provider_timeout_is_not_reclassified_as_host_watchdog_timeout():
+    callbacks = []
+
+    def worker(fence):
+        fence.touch_progress()
+        raise TimeoutError("provider request deadline")
+
+    with pytest.raises(TimeoutError, match="provider request deadline"):
+        run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=[{"role": "user", "content": "preserve"}],
+            system_prompt_fallback="stable prompt",
+            idle_timeout_seconds=0.4,
+            total_ceiling_seconds=2,
+            on_timeout=lambda *args: callbacks.append(args),
+        )
+    assert callbacks == []
+
+
+def test_completed_result_wins_when_wait_slice_expiry_races_completion(monkeypatch):
+    import concurrent.futures
+    from agent import conversation_compression as compression
+
+    class CompletedDuringWait:
+        def __init__(self, inner):
+            self.inner = inner
+            self.first_wait = True
+
+        def result(self, timeout=None):
+            if self.first_wait:
+                self.first_wait = False
+                raise concurrent.futures.TimeoutError()
+            return self.inner.result(timeout=timeout)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    class Executor:
+        def submit(self, worker, fence):
+            future = concurrent.futures.Future()
+            future.set_result(worker(fence))
+            return CompletedDuringWait(future)
+
+    monkeypatch.setattr(compression, "_get_compress_timeout_executor", lambda: Executor())
+    result = run_compress_context_with_progress_timeout(
+        worker=lambda fence: ([{"role": "user", "content": "committed"}], "stable prompt"),
+        messages=[], system_prompt_fallback="fallback",
+        idle_timeout_seconds=0.4, total_ceiling_seconds=2,
+    )
+    assert result == ([{"role": "user", "content": "committed"}], "stable prompt")

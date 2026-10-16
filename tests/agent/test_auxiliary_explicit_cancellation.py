@@ -190,7 +190,8 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
     stream.close()
 
 
-def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None:
+@pytest.mark.parametrize("explicit_cancel", [True, False])
+def test_codex_orphan_timeout_preserves_cached_shared_client(explicit_cancel) -> None:
     """A cancelled Codex worker's delayed timer owns only its event stream."""
     owner_started = threading.Event()
 
@@ -274,13 +275,13 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
     try:
         owner.start()
         assert owner_started.wait(timeout=1)
-        cancel_event.set()
-        owner.join(timeout=1)
-        assert not owner.is_alive()
-        assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
-        # A real frontend clears the reusable host Event when the next turn
-        # starts. The orphan must retain a frozen per-attempt cancellation cause.
-        cancel_event.clear()
+        if explicit_cancel:
+            cancel_event.set()
+            owner.join(timeout=1)
+            assert not owner.is_alive()
+            assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
+            # A frontend clears this reusable Event before the next turn.
+            cancel_event.clear()
 
         # A second user can use the shared client while the cancelled provider
         # worker is still orphaned and its total-timeout timer is still armed.
@@ -296,6 +297,10 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         assert owner_stream.closed.wait(timeout=1)
         time.sleep(0.03)
         assert not real_client.closed.is_set()
+        owner.join(timeout=1)
+        assert not owner.is_alive()
+        if not explicit_cancel:
+            assert isinstance(owner_outcome["exc"], TimeoutError)
         with aux._client_cache_lock:
             assert aux._client_cache[cache_key][0] is wrapper
 
@@ -385,7 +390,8 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
 
     assert not owner.is_alive()
     if winner == "timeout":
-        assert real_client.closed.is_set()
+        assert stream.closed.is_set()
+        assert not real_client.closed.is_set()
         assert isinstance(owner_outcome["exc"], TimeoutError)
         assert not isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
     else:
